@@ -254,7 +254,7 @@ namespace {
         bool robotAutoRelease = false;  // v2.12: robot auto-release (practice mode only)
         bool autoNormalRuns = false; // v2.14: let auto-release work outside practice too
         CCLabelBMFont* autoTag = nullptr;  // v2.14: on-screen "AUTO-RELEASE ON" tag
-        CCLabelBMFont* watermark = nullptr;  // v2.46: always-on "Click Before Frames" label while the buffer is on
+        CCLabelBMFont*  = nullptr;  // v2.46: always-on "Click Before Frames" label while the buffer is on
         bool usedThisAttempt = false;      // v2.46: the buffer was on at some point of this attempt
         bool learn = true;           // v2.13: per-level memory learned from your runs
         bool fullState = true;       // v2.11.1: copy the full v2.8 player state into the ghost
@@ -535,11 +535,8 @@ namespace {
     }
 
     // v2.14: a run outside practice where auto-release can press for you is marked on screen.
-    // v2.46 watermark: whenever the buffer is on (any stage but OFF) the level shows it, and
+    // v2.46 : whenever the buffer is on (any stage but OFF) the level shows it, and
     // can't be turned off, so runs made with the mod are recognisable.
-    void refreshWatermark() {
-        if (!buf.watermark) {
-            return;
         }
         // v2.57: hidden in practice mode (practice runs can't be submitted, and it crowded the
         // checkpoint buttons); always shown in normal mode while the buffer is on.
