@@ -23,7 +23,6 @@
 #include <Geode/modify/HardStreak.hpp>
 #include <Geode/modify/LevelEditorLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/EndLevelLayer.hpp>
 #include <Geode/ui/GeodeUI.hpp>
 #include <Geode/ui/Popup.hpp>
@@ -3268,7 +3267,7 @@ namespace {
     }
 }
 
-// v2.44 in-game menu: pause menu button or F7 in a level. Stage, the main switches,
+// v2.44 in-game menu: F7 in a level. Stage, the main switches,
 // status, and shortcuts to all settings / copy log / forget level.
 class BufferMenu : public geode::Popup {
     struct Option {
@@ -3619,24 +3618,6 @@ class $modify(BufEndLevelLayer, EndLevelLayer) {
         }
         benchFinish();  // a completed run is the best recording there is
         endAttempt();
-    }
-};
-
-class $modify(BufPauseLayer, PauseLayer) {
-    void customSetup() {
-        PauseLayer::customSetup();
-        auto* sprite = ButtonSprite::create("Buffer", "bigFont.fnt", BufferMenu::currentTheme().button, 0.8f);
-        sprite->setScale(0.6f);
-        auto* button = CCMenuItemSpriteExtra::create(sprite, this, menu_selector(BufPauseLayer::onBufferMenu));
-        auto* menu = CCMenu::create();
-        menu->addChild(button);
-        auto win = CCDirector::get()->getWinSize();
-        menu->setPosition({ win.width - 50.f, 30.f });
-        this->addChild(menu, 10);
-    }
-
-    void onBufferMenu(CCObject*) {
-        BufferMenu::open();
     }
 };
 
