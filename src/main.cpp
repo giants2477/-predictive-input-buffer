@@ -87,7 +87,7 @@ namespace {
     constexpr uint64_t SIZE_TYPES = typeBit(GameObjectType::RegularSizePortal) | typeBit(GameObjectType::MiniSizePortal);
 
     bool hasType(uint64_t mask, GameObject* object) {
-         type = static_cast<unsigned>(object->m_objectType);
+        auto type = static_cast<unsigned>(object->m_objectType);
         return type < 64 && ((mask >> type) & 1);
     }
 
@@ -148,7 +148,7 @@ namespace {
         bool panelDirty = false; // v2.71: new log lines, the panel is redrawn once on the next step
         bool perfMode = false;   // v2.71: performance mode
         double userBudget = 6.0; // v2.75: the budget from the settings (budgetMs is this click's)
-        bool Budget = true;  // v2.75: budget follows the frame rate
+        bool autoBudget = true;  // v2.75: budget follows the frame rate
         int keys[6] = { 0, 0, 0, 0, 0, 0 };  // v2.75: stage, menu, export, console, path, forget
         std::unordered_set<GameObject*> simDisabled;  // v2.75: objects a toggle orb switched off in this prediction
         std::deque<std::string> logLines;
@@ -182,10 +182,10 @@ namespace {
         int waveHorizon = 65;         // v2.2: how far ahead wave predictions look (mini = 15 less)
         bool assumeOrbs = true;       // v2.2: the ghost clicks every orb it touches ("calculation mode")
         bool held1 = false, held2 = false;   // button state the ghosts are meant to be in
-        bool 1 = false, 2 = false;   // an orb -click is currently held on this ghost
+        bool auto1 = false, auto2 = false;   // an orb auto-click is currently held on this ghost
         bool orbTiming = true;        // v2.26: orb clicks at specific timings inside the orb
-        int orbClickDelay = 0;        // v2.26: ghost orb -clicks wait this many ticks into the orb
-        int At1 = -1, At2 = -1;      // v2.26: tick a delayed orb auto-click fires (-1 none, -2 done)
+        int orbClickDelay = 0;        // v2.26: ghost orb auto-clicks wait this many ticks into the orb
+        int autoAt1 = -1, autoAt2 = -1;      // v2.26: tick a delayed orb auto-click fires (-1 none, -2 done)
         bool orbWasTiming = false;    // v2.26: the last orb save re-timed a press that was already in the orb
 
         bool tryBothOrbs = true;      // v2.4: if a run touches an orb and dies, retry with the other orb choice
@@ -242,19 +242,19 @@ namespace {
         bool swingSmart = true;       // v2.51: swing "could you have flipped back" scoring + spam guard
         bool train = false;           // v2.51: training mode: predict, never delay, show how early you were
         bool perLevel = true;         // v2.51: stage + switches remembered per level
-        bool heatmap = true;          // v2.51: death marks on the progress bar
-        bool saveDing = true;         // v2.56: ding when a click is saved
-        CCLabelBMFont* hintLabel = nullptr;  // v2.51: training hint ("2t early")
-        CCDrawNode* heatNode = nullptr;      // v2.51: death marks on the progress bar
+        bool heatmap = false;         // disabled so nothing draws on the progress bar
+        bool saveDing = false;        // disabled so saves don't make a sound
+        CCLabelBMFont* hintLabel = nullptr;
+        CCDrawNode* heatNode = nullptr;
         bool ufoSmart = true;         // v2.40: UFO landing + "could you have flapped again" scoring
         bool spiderSmart = true;      // v2.15: spider-aware landing + "could you have flipped back" scoring
         int retapAt = -1;             // v2.15: ticks after the input at which the ghost taps again (-1 = never)
         bool robotSmart = true;       // v2.12: robot presses count as safe if some hold length survives
         bool robotAutoRelease = false; // v2.12: robot auto-release (practice mode only)
         bool autoNormalRuns = false;  // v2.14: let auto-release work outside practice too
-        CCLabelBMFont* autoTag = nullptr;   // v2.14: on-screen "AUTO-RELEASE ON" tag
-        CCLabelBMFont* watermark = nullptr; // v2.46: always-on "Click Before Frames" label while the buffer is on
-        bool usedThisAttempt = false;       // v2.46: the buffer was on at some point of this attempt
+        CCLabelBMFont* autoTag = nullptr;
+        CCLabelBMFont* watermark = nullptr;
+        bool usedThisAttempt = false;
         bool learn = true;            // v2.13: per-level memory learned from your runs
         bool fullState = true;        // v2.11.1: copy the full v2.8 player state into the ghost
         int orbWindow = 16;           // v2.6: how far ahead (ticks) an orb may be for that
@@ -461,8 +461,8 @@ namespace {
         buf.swingSmart = mod->getSettingValue<bool>("swing-smart");
         buf.train = mod->getSettingValue<bool>("training-mode");
         buf.perLevel = mod->getSettingValue<bool>("per-level-settings");
-        buf.heatmap = mod->getSettingValue<bool>("death-heatmap");
-        buf.saveDing = mod->getSettingValue<bool>("save-ding");
+        buf.heatmap = false;
+        buf.saveDing = false;
         buf.moreTime = mod->getSettingValue<bool>("more-time-death-spots");
         buf.dashAutoRelease = mod->getSettingValue<bool>("dash-auto-release");
         buf.perfLog = mod->getSettingValue<bool>("perf-log");
@@ -533,21 +533,9 @@ namespace {
         }
     }
 
-    void refreshWatermark() {
-        if (buf.watermark) {
-            buf.watermark->setVisible(false);
-        }
-    }
+    void refreshWatermark() {}
 
-    void refreshAutoTag() {
-        if (!buf.autoTag) {
-            return;
-        }
-        auto* layer = GameManager::get()->m_playLayer;
-        bool on = buf.enabled && buf.autoNormalRuns && (buf.autoRelease || buf.robotAutoRelease || buf.dashAutoRelease) && layer &&
-            !layer->m_isPracticeMode;
-        buf.autoTag->setVisible(on);
-    }
+    void refreshAutoTag() {}
 
     size_t memorySpots();
 
@@ -2434,10 +2422,6 @@ namespace {
             s->earlySum += t;
             ++s->savesAt[pct];
         }
-        // v2.56: a ding for every real save (training mode shows its hint instead)
-        if (buf.saveDing && !buf.train) {
-            FMODAudioEngine::sharedEngine()->playEffect("counter003.ogg");
-        }
     }
 
     std::string attemptSummary() {
@@ -2463,14 +2447,6 @@ namespace {
         }
         noteSave(layer, ticks);
         say("TRAIN {} {}: {}t ({:g}f) early", what, down ? "press" : "release", ticks, ticks * TICK);
-        if (buf.hintLabel) {
-            buf.hintLabel->setString(fmt::format("{} {:g}f early", down ? "click" : "release", ticks * TICK).c_str());
-            buf.hintLabel->stopAllActions();
-            buf.hintLabel->setOpacity(230);
-            buf.hintLabel->setScale(0.5f);
-            buf.hintLabel->runAction(CCSequence::create(CCEaseBackOut::create(CCScaleTo::create(0.12f, 0.6f)), CCDelayTime::create(0.5f),
-                CCFadeOut::create(0.4f), nullptr));
-        }
         return true;
     }
 
@@ -2565,36 +2541,7 @@ namespace {
         mod->setSavedValue("profile-globals", matjson::Value(nullptr));
     }
 
-    // v2.51 death heatmap: red marks on the progress bar where level memory saw you die,
-    // brighter where you die more.
-    void refreshHeatmap() {
-        auto* layer = GameManager::get()->m_playLayer;
-        if (!buf.heatNode || !layer || !layer->m_progressBar) {
-            return;
-        }
-        buf.heatNode->clear();
-        float length = layer->m_levelLength;
-        if (!buf.heatmap || length <= 0.f) {
-            return;
-        }
-        auto size = layer->m_progressBar->getContentSize();
-        uint32_t most = 0;
-        for (auto const& [slice, spot] : memory) {
-            most = std::max(most, spot.deaths);
-        }
-        if (most == 0) {
-            return;
-        }
-        for (auto const& [slice, spot] : memory) {
-            if (spot.deaths == 0) {
-                continue;
-            }
-            float pct = std::clamp((slice + 0.5f) * SLICE / length, 0.f, 1.f);
-            float x = 2.f + pct * (size.width - 4.f);
-            float heat = static_cast<float>(spot.deaths) / most;
-            buf.heatNode->drawSegment({ x, 2.f }, { x, size.height - 2.f }, 0.7f, { 1.f, 0.35f + 0.3f * (1.f - heat), 0.55f, 0.35f + 0.6f * heat });
-        }
-    }
+    void refreshHeatmap() {}
 
     // v2.51 stats popup text
     std::string statsText() {
@@ -3592,31 +3539,14 @@ public:
     }
 };
 
-// v2.46: the level complete screen says so if the buffer was on during the attempt.
+// Level complete screen: silently finishes the run check and attempt log without adding any UI labels.
 class $modify(BufEndLevelLayer, EndLevelLayer) {
     void customSetup() {
         EndLevelLayer::customSetup();
         if (!buf.usedThisAttempt) {
             return;
         }
-        auto win = CCDirector::get()->getWinSize();
-        auto* label = CCLabelBMFont::create("Click Before Frames was on", "bigFont.fnt");
-        label->setScale(0.35f);
-        label->setColor({ 150, 205, 255 });
-        label->setOpacity(170);
-        label->setAnchorPoint({ 1.f, 1.f });
-        label->setPosition({ win.width - 6.f, win.height - 4.f });
-        this->addChild(label, 100);
-        if (attemptStats.saves > 0) {
-            auto* stats = CCLabelBMFont::create(attemptSummary().c_str(), "bigFont.fnt");
-            stats->setScale(0.28f);
-            stats->setColor({ 255, 190, 225 });
-            stats->setOpacity(170);
-            stats->setAnchorPoint({ 1.f, 1.f });
-            stats->setPosition({ win.width - 6.f, win.height - 16.f });
-            this->addChild(stats, 100);
-        }
-        benchFinish();  // a completed run is the best recording there is
+        benchFinish();
         endAttempt();
     }
 };
@@ -3721,9 +3651,6 @@ class $modify(BufPlayLayer, PlayLayer) {
         benchNeedStart = true;
         benchRecording = false;
         loadProfile();
-        if (buf.saveDing) {
-            FMODAudioEngine::sharedEngine()->preloadEffect("counter003.ogg");  // v2.58: no hitch on the first ding
-        }
         buf.ghost1 = makeGhost(this);
         buf.ghost2 = makeGhost(this);
         buf.ghostLayerBase = buf.ghostLayer->getChildrenCount();
@@ -3805,19 +3732,11 @@ class $modify(BufPlayLayer, PlayLayer) {
         this->addChild(buf.panel);
         refreshPanel();
 
-        buf.hintLabel = CCLabelBMFont::create("", "bigFont.fnt");
-        buf.hintLabel->setColor({ 255, 170, 215 });
-        buf.hintLabel->setOpacity(0);
-        buf.hintLabel->setPosition({ win.width / 2.f, win.height - 40.f });
-        buf.hintLabel->setZOrder(1000);
-        this->addChild(buf.hintLabel);
-
+        buf.watermark = nullptr;
+        buf.autoTag = nullptr;
+        buf.hintLabel = nullptr;
         buf.heatNode = nullptr;
-        if (m_progressBar) {
-            buf.heatNode = CCDrawNode::create();
-            m_progressBar->addChild(buf.heatNode, 5);
-            refreshHeatmap();
-        }
+        buf.usedThisAttempt = false;
 
         // Path view lives in the object layer, so it scrolls with the level.
         buf.pathNode = CCDrawNode::create();
