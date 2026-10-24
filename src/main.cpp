@@ -87,7 +87,7 @@ namespace {
     constexpr uint64_t SIZE_TYPES = typeBit(GameObjectType::RegularSizePortal) | typeBit(GameObjectType::MiniSizePortal);
 
     bool hasType(uint64_t mask, GameObject* object) {
-        auto type = static_cast<unsigned>(object->m_objectType);
+         type = static_cast<unsigned>(object->m_objectType);
         return type < 64 && ((mask >> type) & 1);
     }
 
@@ -148,7 +148,7 @@ namespace {
         bool panelDirty = false; // v2.71: new log lines, the panel is redrawn once on the next step
         bool perfMode = false;   // v2.71: performance mode
         double userBudget = 6.0; // v2.75: the budget from the settings (budgetMs is this click's)
-        bool autoBudget = true;  // v2.75: budget follows the frame rate
+        bool Budget = true;  // v2.75: budget follows the frame rate
         int keys[6] = { 0, 0, 0, 0, 0, 0 };  // v2.75: stage, menu, export, console, path, forget
         std::unordered_set<GameObject*> simDisabled;  // v2.75: objects a toggle orb switched off in this prediction
         std::deque<std::string> logLines;
@@ -182,10 +182,10 @@ namespace {
         int waveHorizon = 65;         // v2.2: how far ahead wave predictions look (mini = 15 less)
         bool assumeOrbs = true;       // v2.2: the ghost clicks every orb it touches ("calculation mode")
         bool held1 = false, held2 = false;   // button state the ghosts are meant to be in
-        bool auto1 = false, auto2 = false;   // an orb auto-click is currently held on this ghost
+        bool 1 = false, 2 = false;   // an orb -click is currently held on this ghost
         bool orbTiming = true;        // v2.26: orb clicks at specific timings inside the orb
-        int orbClickDelay = 0;        // v2.26: ghost orb auto-clicks wait this many ticks into the orb
-        int autoAt1 = -1, autoAt2 = -1;      // v2.26: tick a delayed orb auto-click fires (-1 none, -2 done)
+        int orbClickDelay = 0;        // v2.26: ghost orb -clicks wait this many ticks into the orb
+        int At1 = -1, At2 = -1;      // v2.26: tick a delayed orb auto-click fires (-1 none, -2 done)
         bool orbWasTiming = false;    // v2.26: the last orb save re-timed a press that was already in the orb
 
         bool tryBothOrbs = true;      // v2.4: if a run touches an orb and dies, retry with the other orb choice
@@ -3804,20 +3804,6 @@ class $modify(BufPlayLayer, PlayLayer) {
 
         this->addChild(buf.panel);
         refreshPanel();
-
-        buf.watermark = nullptr;
-        buf.usedThisAttempt = false;
-        refreshWatermark();
-
-        buf.autoTag = CCLabelBMFont::create("AUTO INPUTS ON", "bigFont.fnt");
-        buf.autoTag->setScale(0.24f);
-        buf.autoTag->setColor({ 255, 120, 120 });
-        buf.autoTag->setOpacity(153);  // 60%, like the console; still readable in a recording
-        buf.autoTag->setAnchorPoint({ 1.f, 0.f });
-        buf.autoTag->setPosition({ win.width - 6.f, 4.f });
-        buf.autoTag->setZOrder(1000);
-        this->addChild(buf.autoTag);
-        refreshAutoTag();
 
         buf.hintLabel = CCLabelBMFont::create("", "bigFont.fnt");
         buf.hintLabel->setColor({ 255, 170, 215 });
