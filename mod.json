@@ -337,6 +337,12 @@
 			"description": "While the game is already dropping frames (a frame took over twice as long as it should, and over 20 ms), clicks get at most 4 ms of prediction time so it doesn't get worse. Otherwise the time budget setting is used as it is.",
 			"default": true
 		},
+		"two-player-mode": {
+			"name": "2-Player Mode",
+			"description": "Buffer inputs for both players in 2-player mode levels.",
+			"type": "bool",
+			"default": true
+		},
 		"menu-theme": {
 			"type": "string",
 			"name": "Menu theme",
