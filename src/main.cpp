@@ -1,19 +1,9 @@
-// Click Before Frames v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9, 2-player mode support)
+// Click Before Frames v2.9.1 (Full Audit & 2-Player Mode Support)
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
 // delay and, if a delayed version clearly survives longer, your input is held back
 // and delivered that many physics ticks later. 1 tick = 1/240 s = 0.25 frames @ 60fps.
-//
-// v2 changes:
-//  - Bigger windows: F6 stages up to 32 ticks (8 frames) plus a CUSTOM stage (settings).
-//  - Smart prediction: ghost uses orbs, pads, gravity portals and speed portals; mode /
-//    size / dual / mirror / teleport portals end the prediction as "safe".
-//  - Input queue: every input arriving during a delay is shifted by the same amount,
-//    so taps and hold lengths are preserved (no more swallowed clicks / 1-tick taps).
-//  - Time budget per click so big windows don't hitch.
-//  - Fixes: ghost lifetime, init using `this`, time-warp dt, F6 only when GD focused,
-//    dead flipGravity hook priority, optional console, in-game console (stage + live log, hidden by default).
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
@@ -41,6 +31,7 @@
 #include <filesystem>
 #include <functional>
 #include <fstream>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -51,15 +42,15 @@ namespace {
     constexpr int HOOK_PRIORITY = -1000000;
     constexpr float TICK = 0.25f;
     constexpr size_t PANEL_LINES = 8;
-    constexpr int SPIDER_LAND = 12;  // v2.15: ticks on a surface after a spider input = safe
+    constexpr int SPIDER_LAND = 12;  // ticks on a surface after a spider input = safe
     constexpr int SPAM_STREAK = 3;   // this many fast inputs in a row = wave spam
+    constexpr int P2_SLICE_OFFSET = 1000000; // separates P2 memory slices from P1 in 2P mode
 
     constexpr uint64_t typeBit(GameObjectType type) {
         return 1ull << static_cast<int>(type);
     }
 
     // Objects the ghost always collides with.
-    // v2.61: back to the v2.48 set (v2.49 left CollisionObject out; cube and wave got less consistent)
     constexpr uint64_t COLLIDING_TYPES = typeBit(GameObjectType::Solid) | typeBit(GameObjectType::Hazard) | typeBit(GameObjectType::Slope) |
                                          typeBit(GameObjectType::CollisionObject) | typeBit(GameObjectType::AnimatedHazard);
 
@@ -82,8 +73,7 @@ namespace {
         typeBit(GameObjectType::SpiderPortal) | typeBit(GameObjectType::SwingPortal) | typeBit(GameObjectType::DualPortal) |
         typeBit(GameObjectType::SoloPortal) | typeBit(GameObjectType::TeleportPortal) | typeBit(GameObjectType::TeleportOrb);
 
-    // v2.8: size portals are applied to the ghost instead of ending the prediction.
-    // (Mirror portals only flip the screen, so the ghost simply ignores them.)
+    // Size portals are applied to the ghost instead of ending the prediction.
     constexpr uint64_t SIZE_TYPES = typeBit(GameObjectType::RegularSizePortal) | typeBit(GameObjectType::MiniSizePortal);
 
     bool hasType(uint64_t mask, GameObject* object) {
@@ -99,6 +89,18 @@ namespace {
             case 203: return 1.3f;   // faster
             case 1334: return 1.6f;  // fastest
             default: return 0.f;
+        }
+    }
+
+    bool getBoolSetting(std::string_view key, bool fallback = false) {
+        auto* mod = Mod::get();
+        return mod->hasSetting(key) ? mod->getSettingValue<bool>(key) : fallback;
+    }
+
+    void setBoolSetting(std::string_view key, bool value) {
+        auto* mod = Mod::get();
+        if (mod->hasSetting(key)) {
+            mod->setSettingValue<bool>(key, value);
         }
     }
 
@@ -139,18 +141,18 @@ namespace {
         PlayerObject* ghost1 = nullptr;
         PlayerObject* ghost2 = nullptr;
         CCLayer* ghostLayer = nullptr;
-        unsigned ghostLayerBase = 0;  // v2.24: children the ghost layer has right after the ghosts are made
+        unsigned ghostLayerBase = 0;
 
         CCNode* panel = nullptr;
-        CCLabelBMFont* panelTitle = nullptr;                // current stage
-        std::vector<CCLabelBMFont*> panelLines;             // one label per log line (colored)
-        bool panelOpen = false;  // closed by default, remembered for the session
-        bool panelDirty = false; // v2.71: new log lines, the panel is redrawn once on the next step
-        bool perfMode = false;   // v2.71: performance mode
-        double userBudget = 6.0; // v2.75: the budget from the settings (budgetMs is this click's)
-        bool autoBudget = true;  // v2.75: budget follows the frame rate
-        int keys[6] = { 0, 0, 0, 0, 0, 0 };  // v2.75: stage, menu, export, console, path, forget
-        std::unordered_set<GameObject*> simDisabled;  // v2.75: objects a toggle orb switched off in this prediction
+        CCLabelBMFont* panelTitle = nullptr;
+        std::vector<CCLabelBMFont*> panelLines;
+        bool panelOpen = false;
+        bool panelDirty = false;
+        bool perfMode = false;
+        double userBudget = 6.0;
+        bool autoBudget = true;
+        int keys[6] = { 0, 0, 0, 0, 0, 0 };  // stage, menu, export, console, path, forget
+        std::unordered_set<GameObject*> simDisabled;
         std::deque<std::string> logLines;
 
         bool simulating = false;
@@ -161,7 +163,7 @@ namespace {
         bool appliedInput = false;
         bool isPlayer1 = true;
 
-        // 2-Player mode independent tracking for P2
+        // 2-Player mode independent state for Player 2
         bool twoPlayerSupport = true;
         bool realInputP2 = false;
         bool appliedInputP2 = false;
@@ -182,7 +184,7 @@ namespace {
         int ticksWave = 2;
 
         std::deque<QueuedInput> queue;
-        int shift = 0;  // delay applied to inputs while the queue is active
+        int shift = 0;
 
         float tickLength = TICK;
         int sinceInput = 999;
@@ -191,96 +193,98 @@ namespace {
         bool smart = true;
         bool console = false;
         double budgetMs = 6.0;
-        bool practiceOnly = true;     // v2.1: only buffer in practice mode
-        int groundHorizon = 130;      // v2.1: how far ahead cube/ball/spider predictions look
-        int releaseShift = 0;         // v2.1: delay of the last delivered press, reused for its release
-        int waveHorizon = 65;         // v2.2: how far ahead wave predictions look (mini = 15 less)
-        bool assumeOrbs = true;       // v2.2: the ghost clicks every orb it touches ("calculation mode")
-        bool held1 = false, held2 = false;   // button state the ghosts are meant to be in
-        bool auto1 = false, auto2 = false;   // an orb auto-click is currently held on this ghost
-        bool orbTiming = true;        // v2.26: orb clicks at specific timings inside the orb
-        int orbClickDelay = 0;        // v2.26: ghost orb auto-clicks wait this many ticks into the orb
-        int autoAt1 = -1, autoAt2 = -1;      // v2.26: tick a delayed orb auto-click fires (-1 none, -2 done)
-        bool orbWasTiming = false;    // v2.26: the last orb save re-timed a press that was already in the orb
+        bool practiceOnly = true;
+        int groundHorizon = 130;
+        int releaseShift = 0;
+        int waveHorizon = 65;
+        bool assumeOrbs = true;
+        bool held1 = false, held2 = false;
+        bool auto1 = false, auto2 = false;
+        bool orbTiming = true;
+        int orbClickDelay = 0;
+        int autoAt1 = -1, autoAt2 = -1;
+        bool orbWasTiming = false;
 
-        bool tryBothOrbs = true;      // v2.4: if a run touches an orb and dies, retry with the other orb choice
-        bool orbClick = true;         // v2.4: orb choice of the current run
-        bool touchedOrb = false;      // v2.4: the current run touched an orb
-        bool skipPress = false;       // v2.4: run without pressing anything (auto-release hold check)
-        bool avoidMovers = true;      // v2.4: don't buffer when the ghost's path has moving objects
-        bool sawMover = false;        // v2.4: a run this decision touched a moving object
-        bool trackMovers = false;     // v2.5.1: watch objects only in this run (not in every search run)
-        bool autoRelease = false;     // v2.4: wave auto-release (practice mode only)
-        int autoWindow = 6;           // v2.4: hold must die within this many ticks to auto-release
-        bool autoReleased = false;    // v2.4: we released for you; your real release is swallowed
-        int spamGap = 16;             // v2.5.2: inputs closer than this (ticks) count toward wave spam
-        bool waveMargin = true;       // v2.10: center wave saves in the safe window (1 tick of room)
-        bool waveV46 = false;         // v2.7: use the old v4.6 wave rules instead of the cube-style ones
-        bool orbAlign = true;         // v2.6: hold an early press back until the ghost is inside the orb
-        bool orbAlignGround = false;  // v2.11.1: also align presses made on the ground (jumps)
-        bool ignoreTouching = true;   // v2.31: hazards you touch right now without dying can't kill the ghost
+        bool tryBothOrbs = true;
+        bool orbClick = true;
+        bool touchedOrb = false;
+        bool skipPress = false;
+        bool avoidMovers = true;
+        bool sawMover = false;
+        bool trackMovers = false;
+        bool autoRelease = false;
+        int autoWindow = 6;
+        bool autoReleased = false;
+        int spamGap = 16;
+        bool waveMargin = true;
+        bool waveV46 = false;
+        bool orbAlign = true;
+        bool orbAlignGround = false;
+        bool ignoreTouching = true;
         bool haveRealRect = false;
-        CCRect realRect1, realRect2;  // your hitboxes when the prediction starts
-        std::unordered_set<GameObject*> harmless;  // hazards on you at the start of this prediction
-        int baseEscape = -1;          // v2.36: press-now run only survives if you react by this tick
-        int baseCrash = -1;           // v2.36: ...otherwise it crashes here
-        bool lowLatency = false;      // v2.35: never chain delays, small budget and max delay
-        bool explain = false;         // v2.33: log why an input was passed through untouched
-        bool deathLog = false;        // v2.32: log what kills the press-now ghost on every no-save
-        bool captureKiller = false;   // v2.30: record what kills the ghost in the press-now run
-        bool baseTouchedDown = false; // v2.63: the press-now ghost was back on the ground at some point
+        bool haveRealRect2 = false;
+        CCRect realRect1, realRect2;
+        std::unordered_set<GameObject*> harmless1;
+        std::unordered_set<GameObject*> harmless2;
+        int baseEscape = -1;
+        int baseCrash = -1;
+        bool lowLatency = false;
+        bool explain = false;
+        bool deathLog = false;
+        bool captureKiller = false;
+        bool baseTouchedDown = false;
         bool killerSeen = false;
         int killerTick = -1;
         int killerId = 0, killerType = -1;
         bool killerNoTouch = false, killerDisabled = false;
         CCRect killerRect, ghostDeathRect;
-        bool robustSaves = true;      // v2.28: a save must also survive with you slightly off
-        float ghostShiftX = 0.f;      // v2.28: horizontal offset applied to the ghost's start
-        int lateCrash = 90;           // v2.27: cube / ball crashes after this many ticks aren't this click's (0 = off)
-        bool predictMovers = false;   // v2.27: move objects along their current motion during predictions
-        bool shipBuffer = false;      // v2.25: buffer ship inputs too
-        int shipSpamGap = 6;          // v2.44: ship feathering is normal control, only taps closer than this are spam
-        int shipMaxDelay = 2;         // v2.25: ship's own max delay (240/s ticks)
-        bool perfLog = false;         // v2.21: log time / runs / ghost ticks per click
-        int simRuns = 0;              // v2.21: predictions run for the current click
-        long simTicks = 0;            // v2.21: ghost ticks stepped for the current click
-        bool cbfSync = true;          // v2.18: line the ghost up with Click Between Frames' mid-tick clicks
-        float firstStep = 1.f;        // v2.18: fraction of a tick the ghost's first step lasts
-        bool inRealUpdate = false;    // v2.18: inside P1's physics step (a CBF click lands here)
-        float tickStartX = 0.f;       // v2.18: P1's x at the start of the current tick
-        float tickDx = 0.f;           // v2.18: how far P1 moved in the last full tick
-        bool dashAutoRelease = false; // v2.16: let go of a dash for you when it would crash
-        bool autoDash = false;        // v2.16: the current auto-release ended a dash
-        std::unordered_set<GameObject*> orbsUsed;  // v2.16: orbs the ghost actually used this run
-        bool moreTime = true;         // v2.43: at spots you keep dying, delay to give you more time
-        bool ballSmart = true;        // v2.45: ball landing rules + spam guard
-        bool swingSmart = true;       // v2.51: swing "could you have flipped back" scoring + spam guard
-        bool train = false;           // v2.51: training mode: predict, never delay, show how early you were
-        bool perLevel = true;         // v2.51: stage + switches remembered per level
-        bool heatmap = false;         // disabled so nothing draws on the progress bar
-        bool saveDing = false;        // disabled so saves don't make a sound
+        bool robustSaves = true;
+        float ghostShiftX = 0.f;
+        int lateCrash = 90;
+        bool predictMovers = false;
+        bool shipBuffer = false;
+        int shipSpamGap = 6;
+        int shipMaxDelay = 2;
+        bool perfLog = false;
+        int simRuns = 0;
+        long simTicks = 0;
+        bool cbfSync = true;
+        float firstStep = 1.f;
+        bool inRealUpdate = false;
+        float tickStartX = 0.f;
+        float tickDx = 0.f;
+        bool dashAutoRelease = false;
+        bool autoDash = false;
+        std::unordered_set<GameObject*> orbsUsed;
+        bool moreTime = true;
+        bool ballSmart = true;
+        bool swingSmart = true;
+        bool train = false;
+        bool perLevel = true;
+        bool heatmap = false;
+        bool saveDing = false;
         CCLabelBMFont* hintLabel = nullptr;
         CCDrawNode* heatNode = nullptr;
-        bool ufoSmart = true;         // v2.40: UFO landing + "could you have flapped again" scoring
-        bool spiderSmart = true;      // v2.15: spider-aware landing + "could you have flipped back" scoring
-        int retapAt = -1;             // v2.15: ticks after the input at which the ghost taps again (-1 = never)
-        bool robotSmart = true;       // v2.12: robot presses count as safe if some hold length survives
-        bool robotAutoRelease = false; // v2.12: robot auto-release (practice mode only)
-        bool autoNormalRuns = false;  // v2.14: let auto-release work outside practice too
+        bool ufoSmart = true;
+        bool spiderSmart = true;
+        int retapAt = -1;
+        bool robotSmart = true;
+        bool robotAutoRelease = false;
+        bool autoNormalRuns = false;
         CCLabelBMFont* autoTag = nullptr;
         CCLabelBMFont* watermark = nullptr;
         bool usedThisAttempt = false;
-        bool learn = true;            // v2.13: per-level memory learned from your runs
-        bool fullState = true;        // v2.11.1: copy the full v2.8 player state into the ghost
-        int orbWindow = 16;           // v2.6: how far ahead (ticks) an orb may be for that
-        int simTick = 0;              // v2.6: tick of the current run
-        int firstOrbTick = -1;        // v2.6: first tick the current run touched an orb
-        int orbUsedTick = -1;         // v2.6: first tick the current run actually used an orb
-        bool driftCheck = false;      // v2.4: log how far the real player strays from the prediction
-        std::vector<CCPoint>* recordPath = nullptr;  // v2.4: ghost1 positions of the current run
-        bool showPath = false;        // v2.11: draw the predicted path (F10)
-        CCDrawNode* pathNode = nullptr;  // v2.11: owned by the level's object layer
-        int pathHoldUntil = 0;        // v2.65: live path waits while a click's path is on screen
+        bool learn = true;
+        bool fullState = true;
+        int orbWindow = 16;
+        int simTick = 0;
+        int firstOrbTick = -1;
+        int orbUsedTick = -1;
+        bool driftCheck = false;
+        std::vector<CCPoint>* recordPath = nullptr;
+        bool showPath = false;
+        CCDrawNode* pathNode = nullptr;
+        int pathHoldUntil = 0;
 
         std::unordered_set<GameObject*> simUsed;
         std::vector<ObjSnapshot> snapshots;
@@ -303,25 +307,24 @@ namespace {
         return std::max(1, static_cast<int>(std::lround(ticks240 * stepScale())));
     }
 
-    // v2.4 moving-object guard: last known position of each object the ghost collided with.
     struct Watched {
         double x;
         double y;
         int movedTick;
-        double vx = 0.0;  // v2.27: movement per physics step while it's moving
+        double vx = 0.0;
         double vy = 0.0;
-        double pvx = 0.0; // v2.68: the step before (curved paths: how the direction turns)
+        double pvx = 0.0;
         double pvy = 0.0;
-        double rot = 0.0; // v2.68: rotation, and how much it turns per step
+        double rot = 0.0;
         double vrot = 0.0;
     };
     constexpr int MOVER_TICKS = 120;
     constexpr size_t WATCH_LIMIT = 4096;
     std::unordered_map<GameObject*, Watched> watched;
 
-    // v2.4 drift check: the recorded ghost run for your last input and how far you strayed.
     struct Drift {
         std::vector<CCPoint> path;
+        PlayerObject* player = nullptr;
         bool active = false;
         int index = -1;
         int compared = 0;
@@ -377,7 +380,7 @@ namespace {
 
     constexpr size_t EXPORT_LINES = 400;
     std::deque<std::string> exportLines;
-    int logClock = 0;  // physics steps since the level started, kept by the update hook
+    int logClock = 0;
 
     template <class... Args>
     void say(fmt::format_string<Args...> f, Args&&... args) {
@@ -407,9 +410,13 @@ namespace {
         buf.queueP2.clear();
         buf.shiftP2 = 0;
         buf.releaseShiftP2 = 0;
+        buf.ghostShiftX = 0.f;
+        buf.retapAt = -1;
+        buf.skipPress = false;
+        buf.captureKiller = false;
+        buf.trackMovers = false;
     }
 
-    // v2.75: "F6", "G", "7", "None" -> key code (0 = unbound)
     int parseKey(std::string name) {
         for (auto& c : name) {
             c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -431,65 +438,66 @@ namespace {
 
     void readSettings() {
         auto* mod = Mod::get();
-        buf.smart = mod->getSettingValue<bool>("smart-prediction");
-        buf.budgetMs = mod->getSettingValue<double>("sim-budget-ms");
-        buf.autoBudget = mod->getSettingValue<bool>("auto-budget");
-        // v2.75 rebindable keys
+        buf.smart = getBoolSetting("smart-prediction", true);
+        buf.budgetMs = mod->hasSetting("sim-budget-ms") ? mod->getSettingValue<double>("sim-budget-ms") : 6.0;
+        buf.autoBudget = getBoolSetting("auto-budget", true);
         char const* keyNames[] = { "key-stage", "key-menu", "key-export", "key-console", "key-path", "key-forget" };
+        char const* keyFallbacks[] = { "F6", "F7", "F8", "F9", "F10", "F11" };
         for (int i = 0; i < 6; ++i) {
-            buf.keys[i] = parseKey(mod->getSettingValue<std::string>(keyNames[i]));
+            std::string kStr = mod->hasSetting(keyNames[i]) ? mod->getSettingValue<std::string>(keyNames[i]) : keyFallbacks[i];
+            buf.keys[i] = parseKey(kStr);
         }
-        buf.practiceOnly = mod->getSettingValue<bool>("practice-only");
-        buf.groundHorizon = static_cast<int>(mod->getSettingValue<int64_t>("ground-horizon"));
-        buf.waveHorizon = static_cast<int>(mod->getSettingValue<int64_t>("wave-horizon"));
-        buf.assumeOrbs = mod->getSettingValue<bool>("orb-assume-hit");
+        buf.practiceOnly = getBoolSetting("practice-only", true);
+        buf.groundHorizon = mod->hasSetting("ground-horizon") ? static_cast<int>(mod->getSettingValue<int64_t>("ground-horizon")) : 130;
+        buf.waveHorizon = mod->hasSetting("wave-horizon") ? static_cast<int>(mod->getSettingValue<int64_t>("wave-horizon")) : 65;
+        buf.assumeOrbs = getBoolSetting("orb-assume-hit", true);
         buf.orbClick = buf.assumeOrbs;
-        buf.tryBothOrbs = mod->getSettingValue<bool>("orb-try-both");
-        buf.avoidMovers = mod->getSettingValue<bool>("avoid-moving-objects");
-        buf.autoRelease = mod->getSettingValue<bool>("wave-auto-release");
-        buf.autoWindow = static_cast<int>(mod->getSettingValue<int64_t>("auto-release-window"));
-        buf.driftCheck = mod->getSettingValue<bool>("drift-check");
-        buf.spamGap = static_cast<int>(mod->getSettingValue<int64_t>("wave-spam-gap"));
-        buf.orbAlign = mod->getSettingValue<bool>("orb-align");
-        buf.orbTiming = mod->getSettingValue<bool>("orb-timing");
-        buf.orbAlignGround = mod->getSettingValue<bool>("orb-align-ground");
-        buf.fullState = mod->getSettingValue<bool>("full-ghost-state");
-        buf.learn = mod->getSettingValue<bool>("level-memory");
-        buf.robotSmart = mod->getSettingValue<bool>("robot-smart");
-        buf.spiderSmart = mod->getSettingValue<bool>("spider-smart");
-        buf.ufoSmart = mod->getSettingValue<bool>("ufo-smart");
-        buf.ballSmart = mod->getSettingValue<bool>("ball-smart");
-        buf.swingSmart = mod->getSettingValue<bool>("swing-smart");
-        buf.train = mod->getSettingValue<bool>("training-mode");
-        buf.perLevel = mod->getSettingValue<bool>("per-level-settings");
+        buf.tryBothOrbs = getBoolSetting("orb-try-both", true);
+        buf.avoidMovers = getBoolSetting("avoid-moving-objects", true);
+        buf.autoRelease = getBoolSetting("wave-auto-release", false);
+        buf.autoWindow = mod->hasSetting("auto-release-window") ? static_cast<int>(mod->getSettingValue<int64_t>("auto-release-window")) : 6;
+        buf.driftCheck = getBoolSetting("drift-check", false);
+        buf.spamGap = mod->hasSetting("wave-spam-gap") ? static_cast<int>(mod->getSettingValue<int64_t>("wave-spam-gap")) : 16;
+        buf.orbAlign = getBoolSetting("orb-align", true);
+        buf.orbTiming = getBoolSetting("orb-timing", true);
+        buf.orbAlignGround = getBoolSetting("orb-align-ground", false);
+        buf.fullState = getBoolSetting("full-ghost-state", true);
+        buf.learn = getBoolSetting("level-memory", true);
+        buf.robotSmart = getBoolSetting("robot-smart", true);
+        buf.spiderSmart = getBoolSetting("spider-smart", true);
+        buf.ufoSmart = getBoolSetting("ufo-smart", true);
+        buf.ballSmart = getBoolSetting("ball-smart", true);
+        buf.swingSmart = getBoolSetting("swing-smart", true);
+        buf.train = getBoolSetting("training-mode", false);
+        buf.perLevel = getBoolSetting("per-level-settings", false);
         buf.heatmap = false;
         buf.saveDing = false;
-        buf.moreTime = mod->getSettingValue<bool>("more-time-death-spots");
-        buf.dashAutoRelease = mod->getSettingValue<bool>("dash-auto-release");
-        buf.perfLog = mod->getSettingValue<bool>("perf-log");
-        buf.shipBuffer = mod->getSettingValue<bool>("ship-buffer");
-        buf.twoPlayerSupport = mod->hasSetting("two-player-mode") ? mod->getSettingValue<bool>("two-player-mode") : true;
-        buf.lateCrash = static_cast<int>(mod->getSettingValue<int64_t>("cube-late-crash"));
-        buf.robustSaves = mod->getSettingValue<bool>("robust-saves");
-        buf.ignoreTouching = mod->getSettingValue<bool>("ignore-touching-hazards");
-        buf.deathLog = mod->getSettingValue<bool>("death-log");
-        buf.explain = mod->getSettingValue<bool>("explain-inputs");
-        buf.lowLatency = mod->getSettingValue<bool>("low-latency");
+        buf.moreTime = getBoolSetting("more-time-death-spots", true);
+        buf.dashAutoRelease = getBoolSetting("dash-auto-release", false);
+        buf.perfLog = getBoolSetting("perf-log", false);
+        buf.shipBuffer = getBoolSetting("ship-buffer", false);
+        buf.twoPlayerSupport = getBoolSetting("two-player-mode", true);
+        buf.lateCrash = mod->hasSetting("cube-late-crash") ? static_cast<int>(mod->getSettingValue<int64_t>("cube-late-crash")) : 90;
+        buf.robustSaves = getBoolSetting("robust-saves", true);
+        buf.ignoreTouching = getBoolSetting("ignore-touching-hazards", true);
+        buf.deathLog = getBoolSetting("death-log", false);
+        buf.explain = getBoolSetting("explain-inputs", false);
+        buf.lowLatency = getBoolSetting("low-latency", false);
         if (buf.lowLatency) {
             buf.budgetMs = std::min(buf.budgetMs, 3.0);
             buf.robustSaves = false;
             buf.waveMargin = false;
         }
-        buf.predictMovers = mod->getSettingValue<bool>("predict-moving-objects");
-        buf.shipMaxDelay = static_cast<int>(mod->getSettingValue<int64_t>("ship-max-delay"));
-        buf.shipSpamGap = static_cast<int>(mod->getSettingValue<int64_t>("ship-spam-gap"));
-        buf.cbfSync = mod->getSettingValue<bool>("cbf-sync");
-        buf.robotAutoRelease = mod->getSettingValue<bool>("robot-auto-release");
-        buf.autoNormalRuns = mod->getSettingValue<bool>("auto-release-normal-runs");
-        buf.waveV46 = mod->getSettingValue<bool>("wave-v46");
-        buf.waveMargin = mod->getSettingValue<bool>("wave-safety-margin");
-        buf.orbWindow = static_cast<int>(mod->getSettingValue<int64_t>("orb-align-ticks"));
-        buf.perfMode = mod->getSettingValue<bool>("performance-mode");
+        buf.predictMovers = getBoolSetting("predict-moving-objects", false);
+        buf.shipMaxDelay = mod->hasSetting("ship-max-delay") ? static_cast<int>(mod->getSettingValue<int64_t>("ship-max-delay")) : 2;
+        buf.shipSpamGap = mod->hasSetting("ship-spam-gap") ? static_cast<int>(mod->getSettingValue<int64_t>("ship-spam-gap")) : 6;
+        buf.cbfSync = getBoolSetting("cbf-sync", true);
+        buf.robotAutoRelease = getBoolSetting("robot-auto-release", false);
+        buf.autoNormalRuns = getBoolSetting("auto-release-normal-runs", false);
+        buf.waveV46 = getBoolSetting("wave-v46", false);
+        buf.waveMargin = getBoolSetting("wave-safety-margin", true);
+        buf.orbWindow = mod->hasSetting("orb-align-ticks") ? static_cast<int>(mod->getSettingValue<int64_t>("orb-align-ticks")) : 16;
+        buf.perfMode = getBoolSetting("performance-mode", false);
         if (buf.perfMode) {
             buf.budgetMs = std::min(buf.budgetMs, 4.0);
             buf.robustSaves = false;
@@ -515,9 +523,10 @@ namespace {
     void applyStage() {
         auto const& s = STAGES[buf.stage];
         buf.enabled = s.enabled;
+        auto* mod = Mod::get();
         if (s.custom) {
-            buf.ticksAll = static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-ticks"));
-            buf.ticksWave = static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-wave-ticks"));
+            buf.ticksAll = mod->hasSetting("custom-ticks") ? static_cast<int>(mod->getSettingValue<int64_t>("custom-ticks")) : 8;
+            buf.ticksWave = mod->hasSetting("custom-wave-ticks") ? static_cast<int>(mod->getSettingValue<int64_t>("custom-wave-ticks")) : 8;
         }
         else {
             buf.ticksAll = s.ticksAll;
@@ -593,7 +602,6 @@ namespace {
             buf.ghostLayer->release();
             buf.ghostLayer = nullptr;
         }
-        // panel nodes are owned by the PlayLayer
         buf.panel = nullptr;
         buf.panelTitle = nullptr;
         buf.panelLines.clear();
@@ -606,9 +614,12 @@ namespace {
         buf.rapidP2 = 0;
         buf.autoReleased = false;
         buf.autoReleasedP2 = false;
+        buf.autoDash = false;
+        buf.autoDashP2 = false;
         buf.recordPath = nullptr;
         watched.clear();
         drift.active = false;
+        drift.player = nullptr;
         resetPending();
     }
 
@@ -829,8 +840,8 @@ namespace {
     int tickCount = 0;
 
     enum class InputKind { Tap, Wave, Robot, Other };
-    int pressTick = -1;
-    InputKind pressKind = InputKind::Other;
+    int pressTick[2] = { -1, -1 };
+    InputKind pressKind[2] = { InputKind::Other, InputKind::Other };
 
     InputKind kindOf(PlayerObject* p) {
         if (!p || p->m_isShip) {
@@ -842,21 +853,22 @@ namespace {
         return p->m_isRobot ? InputKind::Robot : InputKind::Tap;
     }
 
-    void recordRealInput(bool down, PlayerObject* p) {
+    void recordRealInput(bool down, PlayerObject* p, bool isP2 = false) {
+        int idx = isP2 ? 1 : 0;
         if (down) {
-            pressTick = tickCount;
-            pressKind = kindOf(p);
+            pressTick[idx] = tickCount;
+            pressKind[idx] = kindOf(p);
             return;
         }
-        if (pressTick < 0) {
+        if (pressTick[idx] < 0) {
             return;
         }
-        int held = tickCount - pressTick;
-        pressTick = -1;
-        if (buf.autoReleased || buf.autoReleasedP2) {
+        int held = tickCount - pressTick[idx];
+        pressTick[idx] = -1;
+        if (isP2 ? buf.autoReleasedP2 : buf.autoReleased) {
             return;
         }
-        switch (pressKind) {
+        switch (pressKind[idx]) {
             case InputKind::Tap: tapHold.add(held); break;
             case InputKind::Robot: robotHold.add(held); break;
             default: break;
@@ -864,11 +876,12 @@ namespace {
     }
 
     void forgetPress() {
-        pressTick = -1;
+        pressTick[0] = -1;
+        pressTick[1] = -1;
     }
 
     int holdEstimate() {
-        return tapHold.pick(st(12), 50);  // ~50 ms, a typical tap
+        return tapHold.pick(st(12), 50);
     }
 
     void watchObject(GameObject* object) {
@@ -917,7 +930,7 @@ namespace {
                 movingNow.push_back(object);
             }
             else if (tickCount - w.movedTick > 1) {
-                w.vx = w.vy = w.pvx = w.pvy = w.vrot = 0.0;  // stopped
+                w.vx = w.vy = w.pvx = w.pvy = w.vrot = 0.0;
             }
             ++it;
         }
@@ -926,10 +939,10 @@ namespace {
     struct Mover {
         GameObject* object;
         double x, y, vx, vy;
-        double turn = 0.0;  // radians the motion direction turns per step (0 = straight)
-        double rotX = 0.0, rotY = 0.0, vrot = 0.0;  // both axes kept as they were (skewed objects)
-        double ax = 0.0, ay = 0.0;  // v2.75: speeding up / slowing down (easing), per step
-        int accelSteps = 0;         // v2.75: how long the easing is followed (until it would stop / over 3x speed)
+        double turn = 0.0;
+        double rotX = 0.0, rotY = 0.0, vrot = 0.0;
+        double ax = 0.0, ay = 0.0;
+        int accelSteps = 0;
     };
     std::vector<Mover> movers;
 
@@ -971,14 +984,16 @@ namespace {
     }
 
     void placeMovers(int steps) {
+        // Cap linear translation extrapolation to ~45 ticks so short Move triggers don't fly off into space
+        int linSteps = steps == 0 ? 0 : std::min(steps, st(45));
         for (auto const& m : movers) {
-            double x = m.x + m.vx * steps;
-            double y = m.y + m.vy * steps;
-            if (m.accelSteps > 0 && steps > 0) {
-                int n = std::min(steps, m.accelSteps);
+            double x = m.x + m.vx * linSteps;
+            double y = m.y + m.vy * linSteps;
+            if (m.accelSteps > 0 && linSteps > 0) {
+                int n = std::min(linSteps, m.accelSteps);
                 double grow = 0.5 * n * (n + 1);
-                x = m.x + m.vx * steps + m.ax * (grow + static_cast<double>(n) * (steps - n));
-                y = m.y + m.vy * steps + m.ay * (grow + static_cast<double>(n) * (steps - n));
+                x = m.x + m.vx * linSteps + m.ax * (grow + static_cast<double>(n) * (linSteps - n));
+                y = m.y + m.vy * linSteps + m.ay * (grow + static_cast<double>(n) * (linSteps - n));
             }
             if (m.turn != 0.0 && steps > 0) {
                 std::complex<double> v { m.vx, m.vy };
@@ -1005,13 +1020,14 @@ namespace {
             return;
         }
         drift.active = false;
+        drift.player = nullptr;
         if (drift.compared >= 8) {
             say("drift {:.1f}u max at t{} over {}t{}", drift.maxErr, drift.maxAt, drift.compared, why);
         }
     }
 
     void driftStep(PlayerObject* real) {
-        if (!drift.active) {
+        if (!drift.active || (drift.player && drift.player != real)) {
             return;
         }
         if (drift.index >= 0) {
@@ -1029,14 +1045,14 @@ namespace {
         ++drift.index;
     }
 
-    constexpr float SLICE = 15.f;          // half a block
-    constexpr int OUTCOME_TICKS = 90;      // alive this long after a decision = it worked
+    constexpr float SLICE = 15.f;
+    constexpr int OUTCOME_TICKS = 90;
 
     struct Spot {
-        uint32_t ok = 0;        // saves here that you survived
-        uint32_t bad = 0;       // saves here followed by a death
-        uint32_t deaths = 0;    // deaths after any decision here
-        uint32_t delaySum = 0;  // sum of the delays of the saves that worked
+        uint32_t ok = 0;
+        uint32_t bad = 0;
+        uint32_t deaths = 0;
+        uint32_t delaySum = 0;
     };
 
     std::unordered_map<int, Spot> memory;
@@ -1049,11 +1065,12 @@ namespace {
         int slice = 0;
         int tick = 0;
         int delay = 0;
-        bool skipped = false;  // v2.64: a save was held back here because of memory
-    } pending;
+        bool skipped = false;
+    } pending[2];
 
-    int sliceOf(PlayerObject* p) {
-        return static_cast<int>(std::floor(p->getPosition().x / SLICE));
+    int sliceOf(PlayerObject* p, bool isP2 = false) {
+        int base = static_cast<int>(std::floor(p->getPosition().x / SLICE));
+        return isP2 ? base + P2_SLICE_OFFSET : base;
     }
 
     Spot spotAround(int slice) {
@@ -1096,7 +1113,8 @@ namespace {
         memory.clear();
         memoryDirty = false;
         memoryUpdates = 0;
-        pending.active = false;
+        pending[0].active = false;
+        pending[1].active = false;
         memoryKey.clear();
         if (!level) {
             return;
@@ -1147,63 +1165,70 @@ namespace {
         }
     }
 
-    void creditPending() {
-        if (!pending.active) {
+    void creditPending(int idx) {
+        auto& pend = pending[idx];
+        if (!pend.active) {
             return;
         }
-        pending.active = false;
-        if (pending.delay > 0) {
-            auto& spot = memory[pending.slice];
+        pend.active = false;
+        if (pend.delay > 0) {
+            auto& spot = memory[pend.slice];
             ++spot.ok;
-            spot.delaySum += static_cast<uint32_t>(std::lround(pending.delay / stepScale()));
+            spot.delaySum += static_cast<uint32_t>(std::lround(pend.delay / stepScale()));
             memoryChanged();
         }
     }
 
-    void memoryNote(PlayerObject* p1, int delay) {
+    void memoryNote(PlayerObject* p, int delay, bool isP2 = false) {
         if (!buf.learn || memoryKey.empty()) {
             return;
         }
-        if (pending.active && tickCount - pending.tick >= st(30)) {
-            creditPending();
+        int idx = isP2 ? 1 : 0;
+        if (pending[idx].active && tickCount - pending[idx].tick >= st(30)) {
+            creditPending(idx);
         }
-        pending = { true, sliceOf(p1), tickCount, delay, false };
+        pending[idx] = { true, sliceOf(p, isP2), tickCount, delay, false };
     }
 
     void memoryTick() {
-        if (pending.active && tickCount - pending.tick >= st(OUTCOME_TICKS)) {
-            creditPending();
+        for (int idx : { 0, 1 }) {
+            if (pending[idx].active && tickCount - pending[idx].tick >= st(OUTCOME_TICKS)) {
+                creditPending(idx);
+            }
         }
     }
 
     bool memorySaysSkip(int slice);
 
     void memoryDeath() {
-        if (!pending.active) {
-            return;
-        }
-        pending.active = false;
-        auto& spot = memory[pending.slice];
-        ++spot.deaths;
-        if (pending.delay > 0) {
-            ++spot.bad;
-        }
-        if (pending.skipped) {
-            int worst = pending.slice;
-            for (int s = pending.slice - 1; s <= pending.slice + 1; ++s) {
-                auto it = memory.find(s);
-                if (it != memory.end() && it->second.bad > memory[worst].bad) {
-                    worst = s;
+        for (int idx : { 0, 1 }) {
+            auto& pend = pending[idx];
+            if (!pend.active) {
+                continue;
+            }
+            pend.active = false;
+            auto& spot = memory[pend.slice];
+            ++spot.deaths;
+            if (pend.delay > 0) {
+                ++spot.bad;
+            }
+            if (pend.skipped) {
+                int worst = pend.slice;
+                for (int s = pend.slice - 1; s <= pend.slice + 1; ++s) {
+                    auto it = memory.find(s);
+                    if (it != memory.end() && it->second.bad > memory[worst].bad) {
+                        worst = s;
+                    }
+                }
+                if (memory[worst].bad > 0) {
+                    --memory[worst].bad;
+                }
+                if (!memorySaysSkip(pend.slice)) {
+                    say("memory: died with the input left alone, saves will be tried here again");
                 }
             }
-            if (memory[worst].bad > 0) {
-                --memory[worst].bad;
-            }
-            if (!memorySaysSkip(pending.slice)) {
-                say("memory: died with the input left alone, saves will be tried here again");
-            }
+            memoryChanged();
         }
-        memoryChanged();
     }
 
     bool memorySaysSkip(int slice) {
@@ -1308,10 +1333,14 @@ namespace {
 
         bool second = dual && buf.ghost2 && p2;
         buf.haveRealRect = buf.ignoreTouching;
-        buf.harmless.clear();
+        buf.haveRealRect2 = buf.ignoreTouching && second;
+        buf.harmless1.clear();
+        buf.harmless2.clear();
         if (buf.haveRealRect) {
             buf.realRect1 = p1->getObjectRect();
-            buf.realRect2 = second ? p2->getObjectRect() : buf.realRect1;
+            if (second) {
+                buf.realRect2 = p2->getObjectRect();
+            }
         }
         copyState(buf.ghost1, p1);
         if (second) {
@@ -1382,7 +1411,8 @@ namespace {
                     }
                 }
             }
-            if (down && releaseAfter >= 0 && tick == delay + releaseAfter && buf.ghost1->m_isDashing) {
+            if (down && releaseAfter >= 0 && tick == delay + releaseAfter &&
+                (buf.ghost1->m_isDashing || (second && buf.ghost2->m_isDashing))) {
                 ++releaseAfter;
             }
             if (releaseAfter >= 0 && tick == delay + releaseAfter) {
@@ -1534,7 +1564,8 @@ namespace {
         }
     }
 
-    void showPaths(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int chosen, bool down, int horizon, int releaseAfter) {
+    void showPaths(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int chosen, bool down, int horizon, int releaseAfter,
+        bool isP2 = false) {
         if (!buf.showPath || !buf.pathNode) {
             return;
         }
@@ -1553,7 +1584,7 @@ namespace {
         if (buf.learn && !memory.empty()) {
             int last = INT_MIN;
             for (auto const& point : now) {
-                int slice = static_cast<int>(std::floor(point.x / SLICE));
+                int slice = static_cast<int>(std::floor(point.x / SLICE)) + (isP2 ? P2_SLICE_OFFSET : 0);
                 if (slice != last && memoryRisky(slice)) {
                     buf.pathNode->drawDot(point, 3.5f, { 1.f, 0.6f, 0.1f, 0.95f });
                 }
@@ -1568,6 +1599,7 @@ namespace {
             return;
         }
         drift.path = recordRun(layer, p1, p2, dual, delay, down, horizon, releaseAfter);
+        drift.player = p1;
         drift.active = !drift.path.empty();
         drift.index = buf.firstStep < 1.f ? 0 : -1;
         drift.compared = 0;
@@ -1581,14 +1613,15 @@ namespace {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count();
     }
 
-    void decided(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter) {
-        memoryNote(p1, delay);
+    void decided(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter,
+        bool isP2 = false) {
+        memoryNote(p1, delay, isP2);
         if (clickMs() > buf.budgetMs * 1.5) {
             finishDrift("");
             return;
         }
         startDrift(layer, p1, p2, dual, delay, down, horizon, releaseAfter);
-        showPaths(layer, p1, p2, dual, delay, down, horizon, releaseAfter);
+        showPaths(layer, p1, p2, dual, delay, down, horizon, releaseAfter, isP2);
     }
 
     int fullWaveHorizon(bool mini) {
@@ -2113,7 +2146,9 @@ namespace {
         buf.ghostDied = false;
         buf.ghostHitPortal = false;
         buf.haveRealRect = false;
-        buf.harmless.clear();
+        buf.haveRealRect2 = false;
+        buf.harmless1.clear();
+        buf.harmless2.clear();
         buf.orbClick = false;
         buf.retapAt = -1;
         copyState(buf.ghost1, p1);
@@ -2263,7 +2298,9 @@ namespace {
         }
         auto v = matjson::Value::object();
         for (auto* key : PROFILE_KEYS) {
-            if (Mod::get()->hasSetting(key)) {
+            if (std::string_view(key) == "two-player-mode" && !Mod::get()->hasSetting(key)) {
+                v[key] = buf.twoPlayerSupport;
+            } else if (Mod::get()->hasSetting(key)) {
                 v[key] = Mod::get()->getSettingValue<bool>(key);
             }
         }
@@ -2276,7 +2313,9 @@ namespace {
         }
         auto* mod = Mod::get();
         for (size_t i = 0; i < std::size(PROFILE_KEYS); ++i) {
-            if (mod->hasSetting(PROFILE_KEYS[i])) {
+            if (std::string_view(PROFILE_KEYS[i]) == "two-player-mode" && !mod->hasSetting(PROFILE_KEYS[i])) {
+                buf.twoPlayerSupport = globals.values[i];
+            } else if (mod->hasSetting(PROFILE_KEYS[i])) {
                 mod->setSettingValue<bool>(PROFILE_KEYS[i], globals.values[i]);
             }
         }
@@ -2295,7 +2334,9 @@ namespace {
         globals.values.clear();
         auto backup = matjson::Value::object();
         for (auto* key : PROFILE_KEYS) {
-            bool value = mod->hasSetting(key) ? mod->getSettingValue<bool>(key) : true;
+            bool value = (std::string_view(key) == "two-player-mode" && !mod->hasSetting(key))
+                ? buf.twoPlayerSupport
+                : getBoolSetting(key, true);
             globals.values.push_back(value);
             backup[key] = value;
         }
@@ -2308,8 +2349,13 @@ namespace {
             return;
         }
         for (auto* key : PROFILE_KEYS) {
-            if (v.contains(key) && mod->hasSetting(key)) {
-                mod->setSettingValue<bool>(key, v[key].asBool().unwrapOr(mod->getSettingValue<bool>(key)));
+            if (v.contains(key)) {
+                bool val = v[key].asBool().unwrapOr(getBoolSetting(key, true));
+                if (std::string_view(key) == "two-player-mode" && !mod->hasSetting(key)) {
+                    buf.twoPlayerSupport = val;
+                } else {
+                    setBoolSetting(key, val);
+                }
             }
         }
         readSettings();
@@ -2358,7 +2404,8 @@ namespace {
             std::map<int, uint32_t> deathsAt;
             for (auto const& [slice, spot] : memory) {
                 if (spot.deaths > 0) {
-                    deathsAt[std::clamp(static_cast<int>((slice + 0.5f) * SLICE / layer->m_levelLength * 100.f), 0, 100)] += spot.deaths;
+                    int rawSlice = slice >= P2_SLICE_OFFSET / 2 ? slice - P2_SLICE_OFFSET : slice;
+                    deathsAt[std::clamp(static_cast<int>((rawSlice + 0.5f) * SLICE / layer->m_levelLength * 100.f), 0, 100)] += spot.deaths;
                 }
             }
             std::vector<std::pair<int, uint32_t>> spots(deathsAt.begin(), deathsAt.end());
@@ -2396,7 +2443,7 @@ namespace {
             return false;
         }
 
-        // In 2-player levels, P1 and P2 have separate buttons, so never simulate P1's input on P2 (or vice versa).
+        // In 1-player dual mode, P1's input steers both players. In 2-player mode, P1 and P2 are separate.
         bool dual = !twoPlayer && inDual;
 
         buf.isPlayer1 = !controlP2;
@@ -2515,7 +2562,7 @@ namespace {
             return true;
         }
 
-        // Releases only matter for wave and robot.
+        // Releases only matter for wave and robot (or ending a dash / ship).
         if (!p1Wave) {
             bool robot = p1->m_isRobot;
             bool wave2 = false;
@@ -2561,6 +2608,7 @@ namespace {
             releaseAfter = anyRobot ? robotHold.pick(-1, 50) : holdEstimate();
         }
 
+        int slice = sliceOf(p1, controlP2);
         bool grounded = p1->m_isOnGround && (!p2 || p2->m_isOnGround);
         if (buf.explain && down && grounded && !buf.orbAlignGround && !anyWave && !anyShip && buf.orbAlign && buf.smart) {
             SimEnd probeEnd;
@@ -2577,9 +2625,9 @@ namespace {
         }
         if (down && !anyWave && !anyShip && buf.orbAlign && buf.smart && (!grounded || buf.orbAlignGround)) {
             int orbLanded = 0;
-            int k = memorySaysSkip(sliceOf(p1)) ? 0 : alignOrb(layer, p1, p2, dual, horizon, releaseAfter, memoryDelay(sliceOf(p1)), &orbLanded);
+            int k = memorySaysSkip(slice) ? 0 : alignOrb(layer, p1, p2, dual, horizon, releaseAfter, memoryDelay(slice), &orbLanded);
             if (k > 0 && trainInstead(layer, k, down, "orb")) {
-                decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+                decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter, controlP2);
                 curAppliedInput = down;
                 return false;
             }
@@ -2587,7 +2635,7 @@ namespace {
                 say("ORB {} +{}t ({:g}f) -> {}t{}", buf.orbWasTiming ? "timing" : "press", k, k * TICK, orbLanded,
                     controlP2 ? " [P2]" : "");
                 noteSave(layer, k);
-                decided(layer, p1, p2, dual, k, down, horizon, releaseAfter);
+                decided(layer, p1, p2, dual, k, down, horizon, releaseAfter, controlP2);
                 curShift = k;
                 queueInput(q, k - early, down);
                 return true;
@@ -2651,7 +2699,7 @@ namespace {
         }
         if (base >= horizon) {
             bool reactMode = cubeStyleWave || shipInput || ufoPress || spiderPress;
-            if (buf.moreTime && buf.learn && reactMode && buf.baseEscape >= 0 && spotAround(sliceOf(p1)).deaths >= 2) {
+            if (buf.moreTime && buf.learn && reactMode && buf.baseEscape >= 0 && spotAround(slice).deaths >= 2) {
                 int crash0 = buf.baseCrash;
                 int bestK = 0;
                 int bestCrash = crash0;
@@ -2677,8 +2725,8 @@ namespace {
                 if (bestK > 0 && !buf.train) {
                     noteSave(layer, bestK);
                     say("MORE TIME {}{} +{}t: crash t{} -> {} (died here {}x)", down ? "press" : "release", tickTag, bestK, crash0,
-                        bestCrash < 0 ? std::string("none") : fmt::format("t{}", bestCrash), spotAround(sliceOf(p1)).deaths);
-                    decided(layer, p1, p2, dual, bestK, down, horizon, releaseAfter);
+                        bestCrash < 0 ? std::string("none") : fmt::format("t{}", bestCrash), spotAround(slice).deaths);
+                    decided(layer, p1, p2, dual, bestK, down, horizon, releaseAfter, controlP2);
                     curShift = bestK;
                     queueInput(q, bestK - early, down);
                     return true;
@@ -2693,7 +2741,7 @@ namespace {
                     say("pass {}{}: safe now (survives the {}t look-ahead)", down ? "press" : "release", tickTag, horizon);
                 }
             }
-            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter, controlP2);
             curAppliedInput = down;
             return false;
         }
@@ -2703,16 +2751,15 @@ namespace {
             if (buf.explain) {
                 say("pass press: crash only at {}t, after the jump would land (late crash rule)", base);
             }
-            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter, controlP2);
             curAppliedInput = down;
             return false;
         }
 
-        int slice = sliceOf(p1);
         if (memorySaysSkip(slice)) {
             say("memory: saves here failed before, input left alone");
-            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
-            pending.skipped = true;
+            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter, controlP2);
+            pending[controlP2 ? 1 : 0].skipped = true;
             curAppliedInput = down;
             return false;
         }
@@ -2762,7 +2809,7 @@ namespace {
         if (saved <= 0) {
             say("no save: {}{} dies in {}t (max {}t, best +{}t -> {}t of {}){}", down ? "press" : "release", tickTag, base, maxDelay,
                 dbgBestK, dbgBestRet, horizon, !crashFixed ? "" : base < st(30) ? " - too late: waiting only makes it crash sooner" : " - same crash at any timing (next obstacle)");
-            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter, controlP2);
             curAppliedInput = down;
             return false;
         }
@@ -2797,20 +2844,21 @@ namespace {
             }
         }
 
-        if (buf.avoidMovers) {
+        // Only allow avoidMovers to cancel a save if predictMovers is off
+        if (buf.avoidMovers && !buf.predictMovers) {
             buf.trackMovers = true;
             simulateOrbs(layer, p1, p2, dual, saved, down, horizon, releaseAfter, horizon, &end);
             buf.trackMovers = false;
         }
-        if (buf.avoidMovers && buf.sawMover) {
+        if (buf.avoidMovers && !buf.predictMovers && buf.sawMover) {
             say("skip +{}t save: moving objects ahead", saved);
-            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter, controlP2);
             curAppliedInput = down;
             return false;
         }
 
         if (trainInstead(layer, saved, down, swingPress ? "swing" : "")) {
-            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
+            decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter, controlP2);
             curAppliedInput = down;
             return false;
         }
@@ -2823,7 +2871,7 @@ namespace {
             : fromMemory ? std::string("  (memory)")
             : cubeStyleWave && marginUsed ? std::string("  +margin")
             : robotPress ? fmt::format("  hold {}t", robotUsedHold) : std::string());
-        decided(layer, p1, p2, dual, saved, down, horizon, releaseAfter);
+        decided(layer, p1, p2, dual, saved, down, horizon, releaseAfter, controlP2);
         curShift = saved;
         queueInput(q, saved - early, down);
         return true;
@@ -2896,13 +2944,13 @@ namespace {
         if (dash && (p->m_isDart || p->m_isBird || p->m_isSwing)) {
             horizon = st(48);
         }
-        buf.trackMovers = buf.avoidMovers;
+        buf.trackMovers = buf.avoidMovers && !buf.predictMovers;
         int release = simulateOrbs(layer, p, p2, dual, 0, false, horizon, -1, horizon, &end);
         buf.trackMovers = false;
         if (release < horizon && release < hold + st(10)) {
             return;
         }
-        if (buf.avoidMovers && buf.sawMover) {
+        if (buf.avoidMovers && !buf.predictMovers && buf.sawMover) {
             return;
         }
         curAutoReleased = true;
@@ -2976,16 +3024,24 @@ namespace {
         bool twoPlayer = layer->m_level && layer->m_level->m_twoPlayerMode;
         if (twoPlayer && buf.twoPlayerSupport && layer->m_gameState.m_isDualMode && layer->m_player2) {
             deliverPendingFor(layer, layer->m_player2, false);
+        } else if (!buf.queueP2.empty() || buf.appliedInputP2) {
+            // Clean up P2 queue if exiting dual mode into a solo section
+            buf.queueP2.clear();
+            buf.shiftP2 = 0;
+            buf.releaseShiftP2 = 0;
+            buf.autoReleasedP2 = false;
+            buf.autoDashP2 = false;
+            if (buf.appliedInputP2) {
+                sendButton(layer, false, false);
+            }
         }
         sweepGhostLayer();
     }
 }
 
-// v2.44 in-game menu: F7 in a level. Stage, the main switches,
-// status, and shortcuts to all settings / copy log / forget level.
 class BufferMenu : public geode::Popup {
     struct Option {
-        char const* key;    // mod setting, or nullptr for the runtime path view
+        char const* key;
         char const* label;
     };
     static constexpr Option OPTIONS[] = {
@@ -3017,7 +3073,8 @@ class BufferMenu : public geode::Popup {
 
 public:
     static Theme currentTheme() {
-        auto name = Mod::get()->getSettingValue<std::string>("menu-theme");
+        auto* mod = Mod::get();
+        std::string name = mod->hasSetting("menu-theme") ? mod->getSettingValue<std::string>("menu-theme") : "Pink";
         if (name == "Blue") {
             return { { 120, 180, 255 }, { 205, 228, 255 }, { 170, 210, 255 }, { 170, 205, 255 }, "GJ_button_06.png" };
         }
@@ -3039,12 +3096,18 @@ private:
 
     static CCSprite* heart(float scale, ccColor3B color) {
         auto* sprite = CCSprite::create("heart.png"_spr);
-        sprite->setScale(scale);
-        sprite->setColor(color);
+        if (!sprite) {
+            sprite = CCSprite::createWithSpriteFrameName("GJ_heartOn_001.png");
+        }
+        if (sprite) {
+            sprite->setScale(scale);
+            sprite->setColor(color);
+        }
         return sprite;
     }
 
     static void pulse(CCNode* node, float scale) {
+        if (!node) return;
         node->runAction(CCRepeatForever::create(CCSequence::create(CCEaseSineInOut::create(CCScaleTo::create(0.45f, scale * 1.18f)),
             CCEaseSineInOut::create(CCScaleTo::create(0.45f, scale)), nullptr)));
     }
@@ -3053,6 +3116,9 @@ private:
         for (int i = 0; i < 9; ++i) {
             bool sparkle = i % 3 == 2;
             auto* sprite = sparkle ? CCSprite::create("sparkle.png"_spr) : heart(0.3f + 0.05f * (i % 3), i % 2 ? m_t.main : m_t.accent);
+            if (!sprite) {
+                continue;
+            }
             if (sparkle) {
                 sprite->setScale(0.35f);
             }
@@ -3088,7 +3154,7 @@ private:
         if (std::string_view(o.key) == "two-player-mode" && !Mod::get()->hasSetting("two-player-mode")) {
             return buf.twoPlayerSupport;
         }
-        return Mod::get()->getSettingValue<bool>(o.key);
+        return getBoolSetting(o.key, false);
     }
 
     void refresh() {
@@ -3107,7 +3173,7 @@ private:
             if (std::string_view(o.key) == "two-player-mode" && !Mod::get()->hasSetting("two-player-mode")) {
                 buf.twoPlayerSupport = value;
             } else {
-                Mod::get()->setSettingValue<bool>(o.key, value);
+                setBoolSetting(o.key, value);
                 readSettings();
             }
             saveProfile();
@@ -3141,10 +3207,10 @@ private:
         auto* mod = Mod::get();
         int which = sender->getTag();
         int stage = which == 0 ? 2 : which == 1 ? 3 : 5;
-        mod->setSettingValue<bool>("robust-saves", true);
-        mod->setSettingValue<bool>("wave-safety-margin", which != 2);
-        mod->setSettingValue<bool>("more-time-death-spots", which != 0);
-        mod->setSettingValue<bool>("low-latency", false);
+        setBoolSetting("robust-saves", true);
+        setBoolSetting("wave-safety-margin", which != 2);
+        setBoolSetting("more-time-death-spots", which != 0);
+        setBoolSetting("low-latency", false);
         buf.stage = stage;
         mod->setSavedValue("stage", buf.stage);
         resetPending();
@@ -3171,7 +3237,8 @@ private:
 
     void onForget(CCObject*) {
         memory.clear();
-        pending.active = false;
+        pending[0].active = false;
+        pending[1].active = false;
         memoryDirty = true;
         saveMemory();
         refreshHeatmap();
@@ -3198,15 +3265,17 @@ protected:
         addFloaters();
 
         for (float side : { -1.f, 1.f }) {
-            auto* h = heart(0.32f, m_t.main);
-            h->setRotation(side * 15.f);
-            m_mainLayer->addChildAtPosition(h, Anchor::Top, { side * 118.f, -20.f });
-            pulse(h, 0.32f);
-            auto* sp = CCSprite::create("sparkle.png"_spr);
-            sp->setScale(0.25f);
-            sp->setColor(m_t.soft);
-            m_mainLayer->addChildAtPosition(sp, Anchor::Top, { side * 134.f, -10.f });
-            sp->runAction(CCRepeatForever::create(CCRotateBy::create(3.f, side * 360.f)));
+            if (auto* h = heart(0.32f, m_t.main)) {
+                h->setRotation(side * 15.f);
+                m_mainLayer->addChildAtPosition(h, Anchor::Top, { side * 118.f, -20.f });
+                pulse(h, 0.32f);
+            }
+            if (auto* sp = CCSprite::create("sparkle.png"_spr)) {
+                sp->setScale(0.25f);
+                sp->setColor(m_t.soft);
+                m_mainLayer->addChildAtPosition(sp, Anchor::Top, { side * 134.f, -10.f });
+                sp->runAction(CCRepeatForever::create(CCRotateBy::create(3.f, side * 360.f)));
+            }
         }
 
         auto* gm = GameManager::get();
@@ -3218,9 +3287,10 @@ protected:
         m_mainLayer->addChildAtPosition(icon, Anchor::TopLeft, { 34.f, -30.f });
         icon->runAction(CCRepeatForever::create(CCSequence::create(CCEaseSineInOut::create(CCMoveBy::create(0.8f, { 0.f, 3.f })),
             CCEaseSineInOut::create(CCMoveBy::create(0.8f, { 0.f, -3.f })), nullptr)));
-        auto* iconHeart = heart(0.2f, m_t.main);
-        m_mainLayer->addChildAtPosition(iconHeart, Anchor::TopLeft, { 52.f, -16.f });
-        pulse(iconHeart, 0.2f);
+        if (auto* iconHeart = heart(0.2f, m_t.main)) {
+            m_mainLayer->addChildAtPosition(iconHeart, Anchor::TopLeft, { 52.f, -16.f });
+            pulse(iconHeart, 0.2f);
+        }
 
         auto* prev = CCMenuItemSpriteExtra::create(CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png"), this,
             menu_selector(BufferMenu::onStage));
@@ -3318,16 +3388,16 @@ class $modify(BufEndLevelLayer, EndLevelLayer) {
 };
 
 $on_mod(Loaded) {
-    buf.console = Mod::get()->getSettingValue<bool>("debug-console");
-    buf.showPath = Mod::get()->getSettingValue<bool>("show-path");
+    buf.console = getBoolSetting("debug-console", false);
+    buf.showPath = getBoolSetting("show-path", false);
     recoverGlobals();
     buf.stage = std::clamp(static_cast<int>(Mod::get()->getSavedValue<int64_t>("stage", 0)), 0, STAGE_COUNT - 1);
     if (!Mod::get()->getSavedValue<bool>("per-level-v262", false)) {
-        Mod::get()->setSettingValue<bool>("per-level-settings", false);
+        setBoolSetting("per-level-settings", false);
         Mod::get()->setSavedValue("per-level-v262", true);
     }
     if (!Mod::get()->getSavedValue<bool>("low-latency-v260", false)) {
-        Mod::get()->setSettingValue<bool>("low-latency", false);
+        setBoolSetting("low-latency", false);
         Mod::get()->setSavedValue("low-latency-v260", true);
     }
     readSettings();
@@ -3344,7 +3414,7 @@ $on_mod(Loaded) {
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: visual only, predictions unaffected");
     }
-    say("v2.76 loaded. F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.9.1 loaded. F6 cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -3380,10 +3450,12 @@ class $modify(BufPlayLayer, PlayLayer) {
             return;
         }
         resetPending();
-        buf.appliedInput = false;
-        buf.appliedInputP2 = false;
+        buf.appliedInput = buf.realInput;
+        buf.appliedInputP2 = buf.realInputP2;
         buf.autoReleased = false;
         buf.autoReleasedP2 = false;
+        buf.autoDash = false;
+        buf.autoDashP2 = false;
         buf.rapid = 0;
         buf.rapidP2 = 0;
         forgetPress();
@@ -3538,8 +3610,15 @@ class $modify(BufPlayLayer, PlayLayer) {
         }
         buf.autoReleased = false;
         buf.autoReleasedP2 = false;
+        buf.autoDash = false;
+        buf.autoDashP2 = false;
         drift.active = false;
+        drift.player = nullptr;
         PlayLayer::resetLevel();
+        // Synchronize appliedInput with realInput after resetLevel so holding across a respawn
+        // doesn't inject a synthetic handleButton(true) on tick 1
+        buf.appliedInput = buf.realInput;
+        buf.appliedInputP2 = buf.realInputP2;
     }
 
     void togglePracticeMode(bool practiceMode) {
@@ -3617,7 +3696,10 @@ class $modify(BufPlayerObject, PlayerObject) {
             return;
         }
         auto* layer = GameManager::get()->m_playLayer;
-        if (layer && this == layer->m_player1) {
+        bool isP1 = layer && this == layer->m_player1;
+        bool isP2 = layer && this == layer->m_player2;
+
+        if (isP1) {
             ++tickCount;
             ++logClock;
             if (buf.enabled) {
@@ -3641,10 +3723,10 @@ class $modify(BufPlayerObject, PlayerObject) {
                 deliverPending(layer, this);
                 livePath(layer, this);
             }
+        } else if (isP2) {
+            driftStep(this);
         }
 
-        bool isP1 = layer && this == layer->m_player1;
-        bool isP2 = layer && this == layer->m_player2;
         if (isP1) {
             buf.tickStartX = getPosition().x;
             buf.inRealUpdate = true;
@@ -3753,7 +3835,7 @@ class $modify(BufPlayerObject, PlayerObject) {
 
     void ringJump(RingObject* ring, bool skipCheck) {
         if (buf.simulating) {
-            if (!buf.smart || !isGhost(this)) {
+            if (!buf.smart || !isGhost(this) || !ring) {
                 return;
             }
             if (buf.orbsUsed.contains(ring)) {
@@ -3763,8 +3845,12 @@ class $modify(BufPlayerObject, PlayerObject) {
             double vy = m_yVelocity;
             bool upsideDown = m_isUpsideDown;
             bool dashing = m_isDashing;
+            bool wasAct = ring->m_isActivated || ring->m_activated;
+            size_t disabledCount = buf.simDisabled.size();
             PlayerObject::ringJump(ring, skipCheck);
-            if (m_yVelocity != vy || m_isUpsideDown != upsideDown || m_isDashing != dashing) {
+            bool nowAct = ring->m_isActivated || ring->m_activated;
+            if (m_yVelocity != vy || m_isUpsideDown != upsideDown || m_isDashing != dashing ||
+                (!wasAct && nowAct) || buf.simDisabled.size() != disabledCount) {
                 buf.orbsUsed.insert(ring);
                 if (buf.orbUsedTick < 0) {
                     buf.orbUsedTick = buf.simTick;
@@ -3810,7 +3896,8 @@ class $modify(BufKeyboard, CCKeyboardDispatcher) {
             }
             else if (is(5)) {
                 memory.clear();
-                pending.active = false;
+                pending[0].active = false;
+                pending[1].active = false;
                 memoryDirty = true;
                 saveMemory();
                 say("memory for this level cleared");
@@ -3873,6 +3960,11 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         uint64_t keep = buf.smart ? (COLLIDING_TYPES | INTERACT_TYPES) : COLLIDING_TYPES;
         bool haveRect = false;
         CCRect ghostRect;
+        bool isG1 = (player == buf.ghost1);
+        auto& harmlessSet = isG1 ? buf.harmless1 : buf.harmless2;
+        bool checkHarmless = isG1 ? buf.haveRealRect : buf.haveRealRect2;
+        CCRect const& startRealRect = isG1 ? buf.realRect1 : buf.realRect2;
+
         auto& list = *objects;
         for (int i = 0; i < objectCount; ++i) {
             auto* object = list[i];
@@ -3885,14 +3977,14 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                 if (!buf.simDisabled.empty() && buf.simDisabled.contains(object)) {
                     continue;
                 }
-                if (buf.haveRealRect && (bit & HAZARD_TYPES)) {
-                    if (!buf.harmless.empty() && buf.harmless.contains(object)) {
+                if (checkHarmless && (bit & HAZARD_TYPES)) {
+                    if (!harmlessSet.empty() && harmlessSet.contains(object)) {
                         continue;
                     }
                     if (buf.simTick <= 1) {
                         auto const& r = object->getObjectRect();
-                        if (r.intersectsRect(buf.realRect1) || r.intersectsRect(buf.realRect2)) {
-                            buf.harmless.insert(object);
+                        if (r.intersectsRect(startRealRect)) {
+                            harmlessSet.insert(object);
                             continue;
                         }
                     }
@@ -3935,13 +4027,14 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
+        bool twoPlayer = m_level && m_level->m_twoPlayerMode;
+        bool controlP2 = twoPlayer && !isPlayer1 && m_gameState.m_isDualMode && m_player2;
         if (!buf.simulating && button == 1 && !buf.injecting) {
-            bool twoPlayer = m_level && m_level->m_twoPlayerMode;
-            auto* targetPlayer = (twoPlayer && !isPlayer1 && m_gameState.m_isDualMode && m_player2) ? m_player2 : m_player1;
+            auto* targetPlayer = controlP2 ? m_player2 : m_player1;
             if (down || (targetPlayer && (targetPlayer->m_isDart || targetPlayer->m_isRobot))) {
                 finishDrift("");
             }
-            recordRealInput(down, targetPlayer);
+            recordRealInput(down, targetPlayer, controlP2);
         }
         if (!buf.simulating && button == 1 && !buf.injecting) {
             buf.simRuns = 0;
@@ -3958,7 +4051,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                 return;
             }
         }
-        if (!buf.simulating && button == 1) {
+        if (!buf.simulating && button == 1 && !controlP2) {
             benchInput(down);
         }
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
