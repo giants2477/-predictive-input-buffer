@@ -46,12 +46,13 @@ namespace {
     constexpr int DELAY_CAP = 31;
     constexpr int MAX_PRE = 8;
     constexpr int TRAJ_MAX = 96;
-    constexpr int SIM_STEP_CAP = 192;
+    constexpr int SIM_STEP_CAP = 192; // Supports 130-tick horizon + up to 31-tick delay without truncation
     constexpr int MIN_EVENT_GAP = 1;
     constexpr int WINDOW_PAD = 1;
     constexpr int SCRATCH_DEPTH = 8;
     constexpr float CLEAR_CAP = 48.0f;
 
+    // Reality Check Tolerances
     constexpr float REALITY_EPS_Y = 7.5f;
     constexpr float REALITY_EPS_X = 24.0f;
     constexpr float REALITY_EPS_SPIDER_Y = 85.0f;
@@ -112,6 +113,7 @@ namespace {
     constexpr uint64_t PORTAL_TYPES = MODE_PORTALS | SIZE_PORTALS | MIRROR_PORTALS | UNSIM_PORTALS;
     constexpr uint64_t HAZARD_TYPES = typeBit(GameObjectType::Hazard) | typeBit(GameObjectType::AnimatedHazard);
 
+    // Special gameplay blocks: D-block (1755), J-block (1813), S-block (1829), H-block (1859), F-block (2866), Force block (2867)
     inline bool isSpecialGameplayBlock(int id) {
         return id == 1755 || id == 1813 || id == 1829 || id == 1859 || id == 2866 || id == 2867;
     }
@@ -130,7 +132,9 @@ namespace {
     template <class L, class P>
     bool isUsing22ShipPhysics(L* layer, P* player) {
         if (player) {
-            if constexpr (requires { player->m_fixGravityBug; }) return player->m_fixGravityBug;
+            if constexpr (requires { player->m_fixGravityBug; }) {
+                return player->m_fixGravityBug;
+            }
         }
         if (layer) {
             if constexpr (requires { layer->m_levelSettings->m_fixGravityBug; }) {
@@ -158,28 +162,36 @@ namespace {
     template <class P>
     bool isPlayerSideways(P* player) {
         if (!player) return false;
-        if constexpr (requires { player->m_isSideways; }) return player->m_isSideways;
+        if constexpr (requires { player->m_isSideways; }) {
+            return player->m_isSideways;
+        }
         return false;
     }
 
     template <class P>
     bool wasPlayerTeleported(P* player) {
         if (!player) return false;
-        if constexpr (requires { player->m_wasTeleported; }) return player->m_wasTeleported;
+        if constexpr (requires { player->m_wasTeleported; }) {
+            return player->m_wasTeleported;
+        }
         return false;
     }
 
     template <class R>
     bool isMultiActivateRing(R* ring) {
         if (!ring) return false;
-        if constexpr (requires { ring->m_isMultiActivate; }) return ring->m_isMultiActivate;
+        if constexpr (requires { ring->m_isMultiActivate; }) {
+            return ring->m_isMultiActivate;
+        }
         return false;
     }
 
     template <class L>
     inline bool isAntiCheatObject(L* layer, GameObject* object) {
         if (!layer || !object) return false;
-        if constexpr (requires { layer->m_antiCheatObject; }) return object == layer->m_antiCheatObject;
+        if constexpr (requires { layer->m_antiCheatObject; }) {
+            return object == layer->m_antiCheatObject;
+        }
         return false;
     }
 
@@ -202,7 +214,7 @@ namespace {
     }
 
     // ---------------------------------------------------------------------------
-    // Stages & Configuration (Default = Index 2: +8t / 2f @ 60fps)
+    // Stages & Configuration
     // ---------------------------------------------------------------------------
     struct Stage {
         bool enabled;
@@ -210,11 +222,11 @@ namespace {
     };
 
     constexpr Stage STAGES[] = {
-        { true, 2 },   // Index 0 -> +2t (0.5f @ 60fps)
-        { true, 4 },   // Index 1 -> +4t (1.0f @ 60fps)
-        { true, 8 },   // Index 2 -> +8t (2.0f @ 60fps) [Default]
-        { true, 16 },  // Index 3 -> +16t (4.0f @ 60fps)
-        { false, 0 }   // Index 4 -> OFF
+        { true, 2 },
+        { true, 4 },
+        { true, 8 },
+        { true, 16 },
+        { false, 0 }
     };
     constexpr int STAGE_COUNT = sizeof(STAGES) / sizeof(STAGES[0]);
 
@@ -288,7 +300,9 @@ namespace {
         if (!logReady.load(std::memory_order_relaxed)) return;
         {
             std::lock_guard<std::mutex> lock(logMutex);
-            if (logQueue.size() < 1000) logQueue.push_back(std::move(msg));
+            if (logQueue.size() < 1000) {
+                logQueue.push_back(std::move(msg));
+            }
         }
         logCv.notify_one();
     }
@@ -377,6 +391,9 @@ namespace {
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // Dual-Focus Hotkey Listener
+    // ---------------------------------------------------------------------------
 #ifdef GEODE_IS_WINDOWS
     bool isGameOrConsoleFocused() {
         HWND fg = GetForegroundWindow();
@@ -571,14 +588,22 @@ namespace {
 
     template <class T>
     void saveActivationExtras(T* obj, bool& hasP1, bool& hasP2) {
-        if constexpr (requires { hasP1 = obj->m_hasBeenActivated; }) hasP1 = obj->m_hasBeenActivated;
-        if constexpr (requires { hasP2 = obj->m_hasBeenActivatedP2; }) hasP2 = obj->m_hasBeenActivatedP2;
+        if constexpr (requires { hasP1 = obj->m_hasBeenActivated; }) {
+            hasP1 = obj->m_hasBeenActivated;
+        }
+        if constexpr (requires { hasP2 = obj->m_hasBeenActivatedP2; }) {
+            hasP2 = obj->m_hasBeenActivatedP2;
+        }
     }
 
     template <class T>
     void restoreActivationExtras(T* obj, bool hasP1, bool hasP2) {
-        if constexpr (requires { obj->m_hasBeenActivated = hasP1; }) obj->m_hasBeenActivated = hasP1;
-        if constexpr (requires { obj->m_hasBeenActivatedP2 = hasP2; }) obj->m_hasBeenActivatedP2 = hasP2;
+        if constexpr (requires { obj->m_hasBeenActivated = hasP1; }) {
+            obj->m_hasBeenActivated = hasP1;
+        }
+        if constexpr (requires { obj->m_hasBeenActivatedP2 = hasP2; }) {
+            obj->m_hasBeenActivatedP2 = hasP2;
+        }
     }
 
     template <class T>
@@ -645,9 +670,11 @@ namespace {
         int unverifiedTicks = 0;
         float tickClear = CLEAR_CAP;
 
+        // Re-entrancy-safe 8-level scratch buffer pool for recursive collision checks
         gd::vector<GameObject*> filteredScratch[SCRATCH_DEPTH];
         int collisionDepth = 0;
 
+        // Pre-reserved snapshot & per-ghost consumed sets
         std::unordered_set<GameObject*> snapshotted;
         std::unordered_set<GameObject*> consumedP1;
         std::unordered_set<GameObject*> consumedP2;
@@ -670,7 +697,9 @@ namespace {
             consumedP1.reserve(64);
             consumedP2.reserve(64);
             snapshots.reserve(64);
-            for (int i = 0; i < SCRATCH_DEPTH; ++i) filteredScratch[i].reserve(128);
+            for (int i = 0; i < SCRATCH_DEPTH; ++i) {
+                filteredScratch[i].reserve(128);
+            }
         }
 
         void recordSubstepDt(float dt) {
@@ -703,7 +732,9 @@ namespace {
             consumedRingsCount = 0;
         }
 
-        void resetQueue() { queue.clear(); }
+        void resetQueue() {
+            queue.clear();
+        }
 
         void resetVerification() {
             traj.active = false;
@@ -791,30 +822,36 @@ namespace {
         }
     }
 
+    // Ship (2) and Wave (1) check 65 ticks; all other modes check 130 ticks
     int getModeHorizon(PlayLayer* layer, PlayerObject* p, int mode) {
-        (void)layer; (void)p;
-        return (mode == 1 || mode == 2) ? 65 : 130;
+        (void)layer;
+        (void)p;
+        if (mode == 1 || mode == 2) {
+            return 65;
+        }
+        return 130;
     }
 
+    // Phase-1 Commitment Window before SmartPilot is allowed to assist with subsequent obstacles
     int getPilotCommitWindow(PlayerObject* p, int mode, bool isBaseline) {
         bool mini = p && p->m_vehicleSize < 1.0f;
         if (!isBaseline) {
             switch (mode) {
-                case 1: return mini ? 8 : 10;
-                case 2: return 6;
-                case 3: return 10;
-                case 4: return 10;
-                default: return 7;
+                case 1: return mini ? 8 : 10; // Wave candidate
+                case 2: return 6;             // Ship candidate
+                case 3: return 10;            // UFO candidate
+                case 4: return 10;            // Swing candidate
+                default: return 7;            // Cube, Ball, Robot, Spider candidate
             }
         }
         switch (mode) {
-            case 1: return mini ? 13 : 16;
-            case 2: return mini ? 18 : 22;
-            case 3: return mini ? 22 : 26;
-            case 4: return mini ? 18 : 22;
-            case 5: return mini ? 20 : 24;
-            case 7: return mini ? 16 : 20;
-            default: return mini ? 22 : 26;
+            case 1: return mini ? 13 : 16; // Wave baseline imminent danger window
+            case 2: return mini ? 18 : 22; // Ship baseline commitment window
+            case 3: return mini ? 22 : 26; // UFO baseline commitment window
+            case 4: return mini ? 18 : 22; // Swing baseline commitment window
+            case 5: return mini ? 20 : 24; // Ball baseline commitment window
+            case 7: return mini ? 16 : 20; // Spider baseline commitment window
+            default: return mini ? 22 : 26; // Cube & Robot baseline commitment window
         }
     }
 
@@ -859,65 +896,187 @@ namespace {
 
     template <class P>
     void syncOptionalFields(P* ghost, P* real) {
-        if constexpr (requires { ghost->m_isHolding = real->m_isHolding; }) ghost->m_isHolding = real->m_isHolding;
-        if constexpr (requires { ghost->m_hasJustHeld = real->m_hasJustHeld; }) ghost->m_hasJustHeld = real->m_hasJustHeld;
-        if constexpr (requires { ghost->m_isHolding2 = real->m_isHolding2; }) ghost->m_isHolding2 = real->m_isHolding2;
-        if constexpr (requires { ghost->m_hasJustHeld2 = real->m_hasJustHeld2; }) ghost->m_hasJustHeld2 = real->m_hasJustHeld2;
-        if constexpr (requires { ghost->m_position = real->m_position; }) ghost->m_position = real->m_position;
-        if constexpr (requires { ghost->m_lastPosition = real->m_lastPosition; }) ghost->m_lastPosition = real->m_lastPosition;
-        if constexpr (requires { ghost->m_lastGroundedPos = real->m_lastGroundedPos; }) ghost->m_lastGroundedPos = real->m_lastGroundedPos;
-        if constexpr (requires { ghost->m_fixGravityBug = real->m_fixGravityBug; }) ghost->m_fixGravityBug = real->m_fixGravityBug;
-        if constexpr (requires { ghost->m_fixRobotJump = real->m_fixRobotJump; }) ghost->m_fixRobotJump = real->m_fixRobotJump;
-        if constexpr (requires { ghost->m_inputsLocked = real->m_inputsLocked; }) ghost->m_inputsLocked = real->m_inputsLocked;
-        if constexpr (requires { ghost->m_isSideways = real->m_isSideways; }) ghost->m_isSideways = real->m_isSideways;
-        if constexpr (requires { ghost->m_reverseRelated = real->m_reverseRelated; }) ghost->m_reverseRelated = real->m_reverseRelated;
-        if constexpr (requires { ghost->m_maybeReverseSpeed = real->m_maybeReverseSpeed; }) ghost->m_maybeReverseSpeed = real->m_maybeReverseSpeed;
-        if constexpr (requires { ghost->m_maybeReverseAcceleration = real->m_maybeReverseAcceleration; }) ghost->m_maybeReverseAcceleration = real->m_maybeReverseAcceleration;
-        if constexpr (requires { ghost->m_xVelocityRelated2 = real->m_xVelocityRelated2; }) ghost->m_xVelocityRelated2 = real->m_xVelocityRelated2;
-        if constexpr (requires { ghost->m_reverseSync = real->m_reverseSync; }) ghost->m_reverseSync = real->m_reverseSync;
-        if constexpr (requires { ghost->m_stateForce = real->m_stateForce; }) ghost->m_stateForce = real->m_stateForce;
-        if constexpr (requires { ghost->m_stateForceVector = real->m_stateForceVector; }) ghost->m_stateForceVector = real->m_stateForceVector;
-        if constexpr (requires { ghost->m_maybeStateForce2 = real->m_maybeStateForce2; }) ghost->m_maybeStateForce2 = real->m_maybeStateForce2;
-        if constexpr (requires { ghost->m_affectedByForces = real->m_affectedByForces; }) ghost->m_affectedByForces = real->m_affectedByForces;
-        if constexpr (requires { ghost->m_stateBoostX = real->m_stateBoostX; }) ghost->m_stateBoostX = real->m_stateBoostX;
-        if constexpr (requires { ghost->m_stateBoostY = real->m_stateBoostY; }) ghost->m_stateBoostY = real->m_stateBoostY;
-        if constexpr (requires { ghost->m_stateScale = real->m_stateScale; }) ghost->m_stateScale = real->m_stateScale;
-        if constexpr (requires { ghost->m_stateNoAutoJump = real->m_stateNoAutoJump; }) ghost->m_stateNoAutoJump = real->m_stateNoAutoJump;
-        if constexpr (requires { ghost->m_stateDartSlide = real->m_stateDartSlide; }) ghost->m_stateDartSlide = real->m_stateDartSlide;
-        if constexpr (requires { ghost->m_stateHitHead = real->m_stateHitHead; }) ghost->m_stateHitHead = real->m_stateHitHead;
-        if constexpr (requires { ghost->m_stateFlipGravity = real->m_stateFlipGravity; }) ghost->m_stateFlipGravity = real->m_stateFlipGravity;
-        if constexpr (requires { ghost->m_stateOnGround = real->m_stateOnGround; }) ghost->m_stateOnGround = real->m_stateOnGround;
-        if constexpr (requires { ghost->m_stateNoStickX = real->m_stateNoStickX; }) ghost->m_stateNoStickX = real->m_stateNoStickX;
-        if constexpr (requires { ghost->m_stateNoStickY = real->m_stateNoStickY; }) ghost->m_stateNoStickY = real->m_stateNoStickY;
-        if constexpr (requires { ghost->m_gravity = real->m_gravity; }) ghost->m_gravity = real->m_gravity;
-        if constexpr (requires { ghost->m_fallSpeed = real->m_fallSpeed; }) ghost->m_fallSpeed = real->m_fallSpeed;
-        if constexpr (requires { ghost->m_playerSpeedAC = real->m_playerSpeedAC; }) ghost->m_playerSpeedAC = real->m_playerSpeedAC;
-        if constexpr (requires { ghost->m_shipRotation = real->m_shipRotation; }) ghost->m_shipRotation = real->m_shipRotation;
-        if constexpr (requires { ghost->m_yVelocityBeforeSlope = real->m_yVelocityBeforeSlope; }) ghost->m_yVelocityBeforeSlope = real->m_yVelocityBeforeSlope;
-        if constexpr (requires { ghost->m_dashStartTime = real->m_dashStartTime; }) ghost->m_dashStartTime = real->m_dashStartTime;
-        if constexpr (requires { ghost->m_slopeStartTime = real->m_slopeStartTime; }) ghost->m_slopeStartTime = real->m_slopeStartTime;
-        if constexpr (requires { ghost->m_lastLandTime = real->m_lastLandTime; }) ghost->m_lastLandTime = real->m_lastLandTime;
-        if constexpr (requires { ghost->m_totalTime = real->m_totalTime; }) ghost->m_totalTime = real->m_totalTime;
-        if constexpr (requires { ghost->m_isOnGround2 = real->m_isOnGround2; }) ghost->m_isOnGround2 = real->m_isOnGround2;
-        if constexpr (requires { ghost->m_isOnGround3 = real->m_isOnGround3; }) ghost->m_isOnGround3 = real->m_isOnGround3;
-        if constexpr (requires { ghost->m_isOnGround4 = real->m_isOnGround4; }) ghost->m_isOnGround4 = real->m_isOnGround4;
-        if constexpr (requires { ghost->m_wasOnGround = real->m_wasOnGround; }) ghost->m_wasOnGround = real->m_wasOnGround;
-        if constexpr (requires { ghost->m_isSliding = real->m_isSliding; }) ghost->m_isSliding = real->m_isSliding;
-        if constexpr (requires { ghost->m_isOnSlope = real->m_isOnSlope; }) ghost->m_isOnSlope = real->m_isOnSlope;
-        if constexpr (requires { ghost->m_wasOnSlope = real->m_wasOnSlope; }) ghost->m_wasOnSlope = real->m_wasOnSlope;
-        if constexpr (requires { ghost->m_slopeVelocity = real->m_slopeVelocity; }) ghost->m_slopeVelocity = real->m_slopeVelocity;
-        if constexpr (requires { ghost->m_isUpSlope = real->m_isUpSlope; }) ghost->m_isUpSlope = real->m_isUpSlope;
-        if constexpr (requires { ghost->m_isDownSlope = real->m_isDownSlope; }) ghost->m_isDownSlope = real->m_isDownSlope;
-        if constexpr (requires { ghost->m_maybeUpsideDownSlope = real->m_maybeUpsideDownSlope; }) ghost->m_maybeUpsideDownSlope = real->m_maybeUpsideDownSlope;
-        if constexpr (requires { ghost->m_slopeAngle = real->m_slopeAngle; }) ghost->m_slopeAngle = real->m_slopeAngle;
-        if constexpr (requires { ghost->m_slopeSlidingMaybeRotated = real->m_slopeSlidingMaybeRotated; }) ghost->m_slopeSlidingMaybeRotated = real->m_slopeSlidingMaybeRotated;
-        if constexpr (requires { ghost->m_CurrentSlope = real->m_CurrentSlope; }) ghost->m_CurrentSlope = real->m_CurrentSlope;
-        if constexpr (requires { ghost->m_LastSlope = real->m_LastSlope; }) ghost->m_LastSlope = real->m_LastSlope;
-        if constexpr (requires { ghost->m_robotJumpTime = real->m_robotJumpTime; }) ghost->m_robotJumpTime = real->m_robotJumpTime;
-        if constexpr (requires { ghost->m_wasTeleported = false; }) ghost->m_wasTeleported = false;
-        if constexpr (requires { ghost->m_isDead = false; }) ghost->m_isDead = false;
-        if constexpr (requires { ghost->m_isLocked = false; }) ghost->m_isLocked = false;
+        if constexpr (requires { ghost->m_isHolding = real->m_isHolding; }) {
+            ghost->m_isHolding = real->m_isHolding;
+        }
+        if constexpr (requires { ghost->m_hasJustHeld = real->m_hasJustHeld; }) {
+            ghost->m_hasJustHeld = real->m_hasJustHeld;
+        }
+        if constexpr (requires { ghost->m_isHolding2 = real->m_isHolding2; }) {
+            ghost->m_isHolding2 = real->m_isHolding2;
+        }
+        if constexpr (requires { ghost->m_hasJustHeld2 = real->m_hasJustHeld2; }) {
+            ghost->m_hasJustHeld2 = real->m_hasJustHeld2;
+        }
 
+        if constexpr (requires { ghost->m_position = real->m_position; }) {
+            ghost->m_position = real->m_position;
+        }
+        if constexpr (requires { ghost->m_lastPosition = real->m_lastPosition; }) {
+            ghost->m_lastPosition = real->m_lastPosition;
+        }
+        if constexpr (requires { ghost->m_lastGroundedPos = real->m_lastGroundedPos; }) {
+            ghost->m_lastGroundedPos = real->m_lastGroundedPos;
+        }
+
+        if constexpr (requires { ghost->m_fixGravityBug = real->m_fixGravityBug; }) {
+            ghost->m_fixGravityBug = real->m_fixGravityBug;
+        }
+        if constexpr (requires { ghost->m_fixRobotJump = real->m_fixRobotJump; }) {
+            ghost->m_fixRobotJump = real->m_fixRobotJump;
+        }
+        if constexpr (requires { ghost->m_inputsLocked = real->m_inputsLocked; }) {
+            ghost->m_inputsLocked = real->m_inputsLocked;
+        }
+
+        if constexpr (requires { ghost->m_isSideways = real->m_isSideways; }) {
+            ghost->m_isSideways = real->m_isSideways;
+        }
+        if constexpr (requires { ghost->m_reverseRelated = real->m_reverseRelated; }) {
+            ghost->m_reverseRelated = real->m_reverseRelated;
+        }
+        if constexpr (requires { ghost->m_maybeReverseSpeed = real->m_maybeReverseSpeed; }) {
+            ghost->m_maybeReverseSpeed = real->m_maybeReverseSpeed;
+        }
+        if constexpr (requires { ghost->m_maybeReverseAcceleration = real->m_maybeReverseAcceleration; }) {
+            ghost->m_maybeReverseAcceleration = real->m_maybeReverseAcceleration;
+        }
+        if constexpr (requires { ghost->m_xVelocityRelated2 = real->m_xVelocityRelated2; }) {
+            ghost->m_xVelocityRelated2 = real->m_xVelocityRelated2;
+        }
+        if constexpr (requires { ghost->m_reverseSync = real->m_reverseSync; }) {
+            ghost->m_reverseSync = real->m_reverseSync;
+        }
+
+        if constexpr (requires { ghost->m_stateForce = real->m_stateForce; }) {
+            ghost->m_stateForce = real->m_stateForce;
+        }
+        if constexpr (requires { ghost->m_stateForceVector = real->m_stateForceVector; }) {
+            ghost->m_stateForceVector = real->m_stateForceVector;
+        }
+        if constexpr (requires { ghost->m_maybeStateForce2 = real->m_maybeStateForce2; }) {
+            ghost->m_maybeStateForce2 = real->m_maybeStateForce2;
+        }
+        if constexpr (requires { ghost->m_affectedByForces = real->m_affectedByForces; }) {
+            ghost->m_affectedByForces = real->m_affectedByForces;
+        }
+        if constexpr (requires { ghost->m_stateBoostX = real->m_stateBoostX; }) {
+            ghost->m_stateBoostX = real->m_stateBoostX;
+        }
+        if constexpr (requires { ghost->m_stateBoostY = real->m_stateBoostY; }) {
+            ghost->m_stateBoostY = real->m_stateBoostY;
+        }
+        if constexpr (requires { ghost->m_stateScale = real->m_stateScale; }) {
+            ghost->m_stateScale = real->m_stateScale;
+        }
+        if constexpr (requires { ghost->m_stateNoAutoJump = real->m_stateNoAutoJump; }) {
+            ghost->m_stateNoAutoJump = real->m_stateNoAutoJump;
+        }
+        if constexpr (requires { ghost->m_stateDartSlide = real->m_stateDartSlide; }) {
+            ghost->m_stateDartSlide = real->m_stateDartSlide;
+        }
+        if constexpr (requires { ghost->m_stateHitHead = real->m_stateHitHead; }) {
+            ghost->m_stateHitHead = real->m_stateHitHead;
+        }
+        if constexpr (requires { ghost->m_stateFlipGravity = real->m_stateFlipGravity; }) {
+            ghost->m_stateFlipGravity = real->m_stateFlipGravity;
+        }
+        if constexpr (requires { ghost->m_stateOnGround = real->m_stateOnGround; }) {
+            ghost->m_stateOnGround = real->m_stateOnGround;
+        }
+        if constexpr (requires { ghost->m_stateNoStickX = real->m_stateNoStickX; }) {
+            ghost->m_stateNoStickX = real->m_stateNoStickX;
+        }
+        if constexpr (requires { ghost->m_stateNoStickY = real->m_stateNoStickY; }) {
+            ghost->m_stateNoStickY = real->m_stateNoStickY;
+        }
+
+        if constexpr (requires { ghost->m_gravity = real->m_gravity; }) {
+            ghost->m_gravity = real->m_gravity;
+        }
+        if constexpr (requires { ghost->m_fallSpeed = real->m_fallSpeed; }) {
+            ghost->m_fallSpeed = real->m_fallSpeed;
+        }
+        if constexpr (requires { ghost->m_playerSpeedAC = real->m_playerSpeedAC; }) {
+            ghost->m_playerSpeedAC = real->m_playerSpeedAC;
+        }
+        if constexpr (requires { ghost->m_shipRotation = real->m_shipRotation; }) {
+            ghost->m_shipRotation = real->m_shipRotation;
+        }
+        if constexpr (requires { ghost->m_yVelocityBeforeSlope = real->m_yVelocityBeforeSlope; }) {
+            ghost->m_yVelocityBeforeSlope = real->m_yVelocityBeforeSlope;
+        }
+        if constexpr (requires { ghost->m_dashStartTime = real->m_dashStartTime; }) {
+            ghost->m_dashStartTime = real->m_dashStartTime;
+        }
+        if constexpr (requires { ghost->m_slopeStartTime = real->m_slopeStartTime; }) {
+            ghost->m_slopeStartTime = real->m_slopeStartTime;
+        }
+        if constexpr (requires { ghost->m_lastLandTime = real->m_lastLandTime; }) {
+            ghost->m_lastLandTime = real->m_lastLandTime;
+        }
+        if constexpr (requires { ghost->m_totalTime = real->m_totalTime; }) {
+            ghost->m_totalTime = real->m_totalTime;
+        }
+        if constexpr (requires { ghost->m_isOnGround2 = real->m_isOnGround2; }) {
+            ghost->m_isOnGround2 = real->m_isOnGround2;
+        }
+        if constexpr (requires { ghost->m_isOnGround3 = real->m_isOnGround3; }) {
+            ghost->m_isOnGround3 = real->m_isOnGround3;
+        }
+        if constexpr (requires { ghost->m_isOnGround4 = real->m_isOnGround4; }) {
+            ghost->m_isOnGround4 = real->m_isOnGround4;
+        }
+        if constexpr (requires { ghost->m_wasOnGround = real->m_wasOnGround; }) {
+            ghost->m_wasOnGround = real->m_wasOnGround;
+        }
+        if constexpr (requires { ghost->m_isSliding = real->m_isSliding; }) {
+            ghost->m_isSliding = real->m_isSliding;
+        }
+        if constexpr (requires { ghost->m_isOnSlope = real->m_isOnSlope; }) {
+            ghost->m_isOnSlope = real->m_isOnSlope;
+        }
+        if constexpr (requires { ghost->m_wasOnSlope = real->m_wasOnSlope; }) {
+            ghost->m_wasOnSlope = real->m_wasOnSlope;
+        }
+        if constexpr (requires { ghost->m_slopeVelocity = real->m_slopeVelocity; }) {
+            ghost->m_slopeVelocity = real->m_slopeVelocity;
+        }
+        if constexpr (requires { ghost->m_isUpSlope = real->m_isUpSlope; }) {
+            ghost->m_isUpSlope = real->m_isUpSlope;
+        }
+        if constexpr (requires { ghost->m_isDownSlope = real->m_isDownSlope; }) {
+            ghost->m_isDownSlope = real->m_isDownSlope;
+        }
+        if constexpr (requires { ghost->m_maybeUpsideDownSlope = real->m_maybeUpsideDownSlope; }) {
+            ghost->m_maybeUpsideDownSlope = real->m_maybeUpsideDownSlope;
+        }
+        if constexpr (requires { ghost->m_slopeAngle = real->m_slopeAngle; }) {
+            ghost->m_slopeAngle = real->m_slopeAngle;
+        }
+        if constexpr (requires { ghost->m_slopeSlidingMaybeRotated = real->m_slopeSlidingMaybeRotated; }) {
+            ghost->m_slopeSlidingMaybeRotated = real->m_slopeSlidingMaybeRotated;
+        }
+        if constexpr (requires { ghost->m_CurrentSlope = real->m_CurrentSlope; }) {
+            ghost->m_CurrentSlope = real->m_CurrentSlope;
+        }
+        if constexpr (requires { ghost->m_LastSlope = real->m_LastSlope; }) {
+            ghost->m_LastSlope = real->m_LastSlope;
+        }
+        if constexpr (requires { ghost->m_robotJumpTime = real->m_robotJumpTime; }) {
+            ghost->m_robotJumpTime = real->m_robotJumpTime;
+        }
+        if constexpr (requires { ghost->m_wasTeleported = false; }) {
+            ghost->m_wasTeleported = false;
+        }
+        if constexpr (requires { ghost->m_isDead = false; }) {
+            ghost->m_isDead = false;
+        }
+        if constexpr (requires { ghost->m_isLocked = false; }) {
+            ghost->m_isLocked = false;
+        }
+
+        // Deep-copy touchedRings container without ever aliasing a raw pointer between ghost and real
         if constexpr (requires { ghost->m_touchedRings->addObjectsFromArray(real->m_touchedRings); }) {
             if (ghost->m_touchedRings && real->m_touchedRings) {
                 ghost->m_touchedRings->removeAllObjects();
@@ -943,6 +1102,7 @@ namespace {
         ghost->setVisible(false);
         ghost->resetTouchedRings(true);
 
+        // 1. Switch ghost to real's vehicle mode FIRST while ghost's mode flags are intact
         applyVehicleSwitch(ghost,
             real->m_isShip   ? GameObjectType::ShipPortal :
             real->m_isBall   ? GameObjectType::BallPortal :
@@ -956,6 +1116,8 @@ namespace {
         ghost->copyAttributes(real);
         ghost->resetTouchedRings(true);
 
+        // 2. Temporarily place ghost in a side-effect-free mid-air Cube state with no ring
+        //    and call pushButton/releaseButton so ALL internal GD button latches are cleanly reset!
         ghost->m_isShip = false;
         ghost->m_isBall = false;
         ghost->m_isBird = false;
@@ -973,6 +1135,7 @@ namespace {
             ghost->releaseButton(PlayerButton::Jump);
         }
 
+        // 3. Restore exact vehicle mode flags
         ghost->m_isShip   = real->m_isShip;
         ghost->m_isBall   = real->m_isBall;
         ghost->m_isBird   = real->m_isBird;
@@ -981,6 +1144,7 @@ namespace {
         ghost->m_isSpider = real->m_isSpider;
         ghost->m_isSwing  = real->m_isSwing;
 
+        // 4. Overwrite with real player's exact physics, velocity, dash, and buffer state
         ghost->m_yVelocity = real->m_yVelocity;
         ghost->m_isGoingLeft = real->m_isGoingLeft;
         ghost->m_dashX = real->m_dashX;
@@ -1029,7 +1193,9 @@ namespace {
         b.appliedInput = down;
         if (pIdx == 0) {
             layer->handleButton(down, 1, true);
-            if (isSymmetricDualActive(layer)) layer->handleButton(down, 1, false);
+            if (isSymmetricDualActive(layer)) {
+                layer->handleButton(down, 1, false);
+            }
         } else {
             layer->handleButton(down, 1, false);
         }
@@ -1038,14 +1204,19 @@ namespace {
 
     void resyncChannel(PlayLayer* layer, int pIdx) {
         auto& b = g_buf[pIdx];
-        if (b.appliedInput != b.realInput) sendPlayerInput(layer, pIdx, b.realInput);
+        if (b.appliedInput != b.realInput) {
+            sendPlayerInput(layer, pIdx, b.realInput);
+        }
     }
 
     void pressGhost(PlayerObject* ghost, bool down) {
         if (!ghost) return;
         ghost->m_holdingButtons[1] = down;
-        if (down) ghost->pushButton(PlayerButton::Jump);
-        else ghost->releaseButton(PlayerButton::Jump);
+        if (down) {
+            ghost->pushButton(PlayerButton::Jump);
+        } else {
+            ghost->releaseButton(PlayerButton::Jump);
+        }
     }
 
     void clearGhostCollisionLogs(PlayerObject* ghost) {
@@ -1058,7 +1229,8 @@ namespace {
 
     template <class G>
     bool isSlopeNegativeDiagonal(G* obj) {
-        bool flipX = false, flipY = false;
+        bool flipX = false;
+        bool flipY = false;
         if constexpr (requires { obj->m_isFlippedX; obj->m_isFlippedY; }) {
             flipX = obj->m_isFlippedX;
             flipY = obj->m_isFlippedY;
@@ -1070,6 +1242,7 @@ namespace {
         return (flipX != flipY) != (quarterTurns != 0);
     }
 
+    // Fast pruned clearance calculation (skips sqrt/hypot whenever dx or dy already exceeds currentBest)
     float computeObjectClearanceFast(PlayerObject* player, CCRect const& pRect, GameObject* obj, unsigned type, float currentBest) {
         CCRect objRect = obj->getObjectRect();
         float dx = std::max({ objRect.getMinX() - pRect.getMaxX(), pRect.getMinX() - objRect.getMaxX(), 0.0f });
@@ -1078,10 +1251,13 @@ namespace {
         if (dy >= currentBest) return currentBest;
 
         float distSq = dx * dx + dy * dy;
-        if (distSq > 0.0f) return (distSq >= currentBest * currentBest) ? currentBest : std::sqrt(distSq);
+        if (distSq > 0.0f) {
+            return (distSq >= currentBest * currentBest) ? currentBest : std::sqrt(distSq);
+        }
 
         CCPoint pCenter = player->getPosition();
-        float cx = objRect.getMidX(), cy = objRect.getMidY();
+        float cx = objRect.getMidX();
+        float cy = objRect.getMidY();
         float pRad = 0.25f * std::min(pRect.size.width, pRect.size.height);
 
         if (type == static_cast<unsigned>(GameObjectType::Slope)) {
@@ -1119,7 +1295,9 @@ namespace {
         } else if (bit & SIZE_PORTALS) {
             bool wantMini = (type == GameObjectType::MiniSizePortal);
             bool isMini = (ghost->m_vehicleSize < 1.0f);
-            if (wantMini != isMini) ghost->togglePlayerScale(wantMini, true);
+            if (wantMini != isMini) {
+                ghost->togglePlayerScale(wantMini, true);
+            }
             ok = true;
         } else if (bit & MIRROR_PORTALS) {
             ok = true;
@@ -1243,15 +1421,25 @@ namespace {
 
         int total = std::min(sp.delay + sp.horizon, SIM_STEP_CAP);
         int pilotGate = sp.delay + std::max(4, sp.pilotStartOffset);
-        int survived = 0, tick = 0, recorded = 0, preIdx = 0;
-        int nextToggle = -1, releaseTapTick = -1, lastPilotActionTick = -99;
+        int survived = 0;
+        int tick = 0;
+        int recorded = 0;
+        int preIdx = 0;
+        int nextToggle = -1;
+        int releaseTapTick = -1;
+        int lastPilotActionTick = -99;
         int assumed = TRAJ_MAX;
         bool died = false;
         bool state = b.ghost1->m_holdingButtons[1];
-        bool surfaceFlipMode = false, upBefore1 = false, upBefore2 = false;
-        bool onGroundAtDelay = false, actionTriggered = false;
+        bool surfaceFlipMode = false;
+        bool upBefore1 = false;
+        bool upBefore2 = false;
+        bool onGroundAtDelay = false;
+        bool actionTriggered = false;
         int ringsBeforeDelay = 0;
-        float minClear = CLEAR_CAP, nearClear = CLEAR_CAP, lastCrossVel = 0.0f;
+        float minClear = CLEAR_CAP;
+        float nearClear = CLEAR_CAP;
+        float lastCrossVel = 0.0f;
 
         for (; tick < total; ++tick) {
             if (!sp.rec && (tick & 15) == 15 && std::chrono::steady_clock::now() >= sp.deadline) {
@@ -1274,6 +1462,7 @@ namespace {
                 upBefore2 = second ? b.ghost2->m_isUpsideDown : false;
                 onGroundAtDelay = b.ghost1->m_isOnGround || (second && b.ghost2->m_isOnGround);
                 ringsBeforeDelay = b.consumedRingsCount;
+                // Only Ball and Spider require ground or an orb to flip; Swing always flips in mid-air
                 surfaceFlipMode = sp.down && (b.ghost1->m_isBall || b.ghost1->m_isSpider);
 
                 pressBoth(sp.down);
@@ -1307,6 +1496,7 @@ namespace {
                 }
             }
 
+            // Policy continuations after the delayed action has been committed
             if (tick > sp.delay) {
                 if (releaseTapTick >= 0 && tick == releaseTapTick) {
                     if (!b.ghost1->m_isDashing) {
@@ -1345,6 +1535,7 @@ namespace {
                         nextToggle = -1;
                     }
 
+                    // 1. Multi-Orb Chain Lookahead: tap unconsumed Jump Rings reached after commitment window
                     int orbGate = std::max(sp.delay + 5, pilotGate - 2);
                     if (tick >= orbGate && !b.ghost1->m_isDashing && (tick - lastPilotActionTick) >= 4) {
                         auto* ring = b.lastTouchedRing;
@@ -1356,14 +1547,18 @@ namespace {
                         }
                     }
 
+                    // 2. Ship Auto-Leveling Pilot: damp vertical velocity toward level flight after commitment window
                     if (b.ghost1->m_isShip && tick >= pilotGate && !b.ghost1->m_isDashing) {
                         bool upside = b.ghost1->m_isUpsideDown;
                         float signedVelInThrustDir = upside ? -lastCrossVel : lastCrossVel;
                         float deadband = (b.ghost1->m_vehicleSize < 1.0f) ? 0.35f : 0.28f;
 
                         bool wantHold = state;
-                        if (signedVelInThrustDir > deadband) wantHold = false;
-                        else if (signedVelInThrustDir < -deadband) wantHold = true;
+                        if (signedVelInThrustDir > deadband) {
+                            wantHold = false;
+                        } else if (signedVelInThrustDir < -deadband) {
+                            wantHold = true;
+                        }
 
                         if (wantHold != state) {
                             assumed = std::min(assumed, tick);
@@ -1373,6 +1568,7 @@ namespace {
                         }
                     }
 
+                    // 3. Swing Apex & Hazard Counter-Flip Pilot
                     if (b.ghost1->m_isSwing && tick >= pilotGate && (tick - lastPilotActionTick) >= 9 && !b.ghost1->m_isDashing) {
                         bool upside = b.ghost1->m_isUpsideDown;
                         float velInGravDir = upside ? lastCrossVel : -lastCrossVel;
@@ -1384,6 +1580,7 @@ namespace {
                         }
                     }
 
+                    // 4. UFO Fall & Hazard Flap Pilot
                     if (b.ghost1->m_isBird && tick >= pilotGate && (tick - lastPilotActionTick) >= 9 && !b.ghost1->m_isDashing) {
                         bool upside = b.ghost1->m_isUpsideDown;
                         float velInGravDir = upside ? lastCrossVel : -lastCrossVel;
@@ -1395,6 +1592,7 @@ namespace {
                         }
                     }
 
+                    // 5. Ball, Spider, Cube & Robot Next-Surface Hazard Pilot
                     if ((b.ghost1->m_isBall || b.ghost1->m_isSpider || (!b.ghost1->m_isDart && !b.ghost1->m_isShip && !b.ghost1->m_isBird && !b.ghost1->m_isSwing)) &&
                         tick >= pilotGate && (tick - lastPilotActionTick) >= 7 &&
                         b.ghost1->m_isOnGround && !b.ghost1->m_isDashing) {
@@ -1408,6 +1606,7 @@ namespace {
                         }
                     }
 
+                    // 6. Wave Corridor Avoidance Pilot
                     if (b.ghost1->m_isDart && tick >= pilotGate && (tick - lastPilotActionTick) >= 5 &&
                         !b.ghost1->m_isDashing && b.tickClear < 8.5f) {
                         assumed = std::min(assumed, tick);
@@ -1419,7 +1618,9 @@ namespace {
             }
 
             b.ghost1->update(dt);
-            if (second) b.ghost2->update(dt);
+            if (second) {
+                b.ghost2->update(dt);
+            }
 
             if (b.ghostDied) {
                 died = true;
@@ -1446,7 +1647,9 @@ namespace {
             }
 
             b.ghost1->updateRotation(dt);
-            if (second) b.ghost2->updateRotation(dt);
+            if (second) {
+                b.ghost2->updateRotation(dt);
+            }
 
             float curX = b.ghost1->getPositionX();
             float curY = b.ghost1->getPositionY();
@@ -1481,10 +1684,14 @@ namespace {
 
             if (b.measureClearance) {
                 minClear = std::min(minClear, b.tickClear);
-                if (survived < 20) nearClear = std::min(nearClear, b.tickClear);
+                if (survived < 20) {
+                    nearClear = std::min(nearClear, b.tickClear);
+                }
             }
             ++survived;
 
+            // For Ball & Spider, verify that at sp.delay (or sp.delay + 1 right after landing in checkCollisions)
+            // the player was on a surface, landed on a surface, flipped gravity, activated an orb, dashed, or spider-teleported.
             if (surfaceFlipMode && !actionTriggered && (tick - sp.delay) <= 1) {
                 bool onGroundNow = b.ghost1->m_isOnGround || (second && b.ghost2->m_isOnGround);
                 bool usedOrb = (b.consumedRingsCount > ringsBeforeDelay);
@@ -1495,7 +1702,9 @@ namespace {
                 }
             }
 
-            if (survived >= sp.stopAt) break;
+            if (survived >= sp.stopAt) {
+                break;
+            }
         }
 
         if ((died || b.simUnverified) && tick < sp.delay) {
@@ -1545,18 +1754,25 @@ namespace {
         pPrimary.rec = recOut;
 
         SimResult best = runSimulation(pIdx, layer, p1, p2, dual, pPrimary, end);
-        if (*end == SimEnd::StopSearch || best.unverified) return best;
+        if (*end == SimEnd::StopSearch || best.unverified) {
+            return best;
+        }
 
+        // Fast return if primary policy is already safe & effective
         if (best.safe && best.effective && (isBaseline || best.nearClear >= 4.5f)) {
             return best;
         }
 
+        // Early Policy-Divergence Pruning:
+        // If Primary died within < 3 ticks after k (before Secondary or SmartPilot ever diverges), skip extra runs!
         int minDivergenceTicks = 3;
         if (!useRhythmPrimary) {
             if (baseParams.rHold > 0) minDivergenceTicks = std::min(minDivergenceTicks, baseParams.rHold);
             if (baseParams.releaseAfter > 0) minDivergenceTicks = std::min(minDivergenceTicks, baseParams.releaseAfter);
         }
-        if (best.survived < minDivergenceTicks && !best.safe) return best;
+        if (best.survived < minDivergenceTicks && !best.safe) {
+            return best;
+        }
 
         auto isBetter = [](SimResult const& cand, SimResult const& cur) {
             if (!cand.effective || cand.unverified) return false;
@@ -1568,6 +1784,7 @@ namespace {
             return candScore > curScore;
         };
 
+        // Secondary Policy: test the opposite of primaryPolicy (Sustained vs Rhythm)
         SimPolicy secondaryPolicy = useRhythmPrimary ? SimPolicy::Sustained : SimPolicy::Rhythm;
         bool allowSecondaryOnBase = !isBaseline || steer || (baseParams.down && !robot && baseParams.releaseAfter > 0);
         if (allowSecondaryOnBase &&
@@ -1592,13 +1809,19 @@ namespace {
                 best = r2;
                 if (recOut) *recOut = altRec;
             }
-            if (isBaseline && best.safe && best.effective) return best;
+            if (isBaseline && best.safe && best.effective) {
+                return best;
+            }
         }
 
+        // On baseline (k = 0), only run SmartPilot if the raw click already survived the full Phase-1 Commitment Window
+        // with safe clearance (so any immediate danger at ticks 1..commitWindow immediately triggers a buffer search,
+        // while far-future obstacles at ticks commitWindow..130 are navigated symmetrically on both baseline and candidates).
         if (isBaseline && (!best.effective || best.survived < commitWindow || best.nearClear < 3.5f)) {
             return best;
         }
 
+        // Tertiary Policy: SmartPilot across all 8 gamemodes after commitWindow
         if ((!best.safe || !best.effective) && best.survived >= 4 &&
             std::chrono::steady_clock::now() < baseParams.deadline) {
             SimParams pPilot = baseParams;
@@ -1719,12 +1942,16 @@ namespace {
         int minEffectiveFloor = baseEffective ? (baseSurvived + minGain) : std::max(24, baseSurvived + minGain);
         bool qualifies = (maxSurvived >= horizon && (!baseEffective || baseSurvived < horizon)) ||
                          (maxSurvived >= minEffectiveFloor);
-        if (!qualifies) return out;
+        if (!qualifies) {
+            return out;
+        }
 
         int winThreshold = (maxSurvived >= horizon) ? horizon : std::max(minEffectiveFloor, maxSurvived - 2);
         float bestWinScore = -99999.0f;
 
-        int segFirst = -1, segLast = -1, segSurv = 0;
+        int segFirst = -1;
+        int segLast = -1;
+        int segSurv = 0;
         bool segP2 = false;
 
         auto commitSegment = [&]() {
@@ -1861,11 +2088,14 @@ namespace {
 
         configureRhythmParams(sp, layer, p1, pIdx, mode, next.down);
 
+        // 1. First verify whether the currently scheduled delay (curPlanned) is still safe & effective
         Trajectory rec;
         SimEnd end = SimEnd::Ok;
         SimResult base = evaluateCandidate(pIdx, layer, p1, p2, dual, sp, curPlanned, false,
                                            recordNewTraj ? &rec : nullptr, &end);
-        if (base.unverified) return false;
+        if (base.unverified) {
+            return false;
+        }
         if (base.safe && base.effective) {
             next.ticksRemaining = curPlanned;
             for (size_t i = 1; i < b.queue.size(); ++i) {
@@ -1882,6 +2112,7 @@ namespace {
             return true;
         }
 
+        // 2. Otherwise search [minDelay .. maxAllowedFromNow] for a safe replacement timing
         SearchResult found = executeSearch(pIdx, layer, p1, p2, dual, sp, minDelay, curPlanned, steer, shipOrSwing,
                                            base.survived, base.effective, maxAllowedFromNow);
         if (found.bestDelay >= minDelay) {
@@ -1920,7 +2151,9 @@ namespace {
         }
 
         int stepIdx = tr.steps++;
-        if (stepIdx == 0) return;
+        if (stepIdx == 0) {
+            return;
+        }
 
         tr.accumDt += (dt > 0.001f && dt < 2.0f) ? dt : b.tickLength;
         float stepDt = (tr.stepDt > 0.001f) ? tr.stepDt : TICK;
@@ -2019,7 +2252,9 @@ namespace {
             return;
         }
 
-        if (delivered) reevaluateQueue(layer, pIdx, player, false, true);
+        if (delivered) {
+            reevaluateQueue(layer, pIdx, player, false, true);
+        }
 
         for (auto& q : b.queue) {
             --q.ticksRemaining;
@@ -2035,6 +2270,8 @@ namespace {
         auto& b = g_buf[pIdx];
         int curTick = g_tickCount.load(std::memory_order_relaxed);
 
+        // In Symmetric Dual mode, GD fires a duplicate handleButton call for P2 on the same tick;
+        // mirror the exact decision made for P1's call on this tick.
         if (!isTwoPlayerDualActive(layer) && b.lastInterceptTick == curTick &&
             b.lastInterceptDown == down && b.lastInterceptIsP1 != isPlayer1) {
             return b.lastInterceptBuffered;
@@ -2084,8 +2321,11 @@ namespace {
         }
 
         int minFloor = b.queue.empty() ? 0 : b.queue.back().ticksRemaining + MIN_EVENT_GAP;
-        if (!down && since == 0) minFloor = std::max(minFloor, 1);
+        if (!down && since == 0) {
+            minFloor = std::max(minFloor, 1);
+        }
 
+        // Preserve the player's actual hold/gap duration when an earlier event is still queued
         int naturalDelay = minFloor;
         if (!b.queue.empty()) {
             int userGap = std::max(MIN_EVENT_GAP, since);
@@ -2108,7 +2348,9 @@ namespace {
         if (!down && !steer && !robot) {
             bool hasActiveBuffer = p1->m_jumpBuffered || p1->m_stateJumpBuffered || p1->m_isDashing ||
                                    (p2 && (p2->m_jumpBuffered || p2->m_stateJumpBuffered || p2->m_isDashing));
-            if (!hasActiveBuffer && b.queue.empty()) return passThrough();
+            if (!hasActiveBuffer && b.queue.empty()) {
+                return passThrough();
+            }
         }
 
         if (maxDelay <= minFloor) return passThrough();
@@ -2193,15 +2435,19 @@ class $modify(BufPlayLayer, PlayLayer) {
             PlayLayer::destroyPlayer(player, object);
             return;
         }
+
         for (int p = 0; p < 2; ++p) {
             if (g_buf[p].simulating && g_buf[p].isGhost(player)) {
                 g_buf[p].ghostDied = true;
                 return;
             }
         }
+
         PlayLayer::destroyPlayer(player, object);
         if (player && player->m_isDead) {
-            for (int p = 0; p < 2; ++p) g_buf[p].resetState();
+            for (int p = 0; p < 2; ++p) {
+                g_buf[p].resetState();
+            }
         }
     }
 
@@ -2390,12 +2636,16 @@ class $modify(BufPlayerObject, PlayerObject) {
                     g_rhythm[pIdx].reset();
                 }
 
-                if (dt > 0.0f) b.recordSubstepDt(dt);
+                if (dt > 0.0f) {
+                    b.recordSubstepDt(dt);
+                }
 
                 if (stageEnabled()) {
                     if (b.triggerStateChanged) {
                         b.triggerStateChanged = false;
-                        if (!b.queue.empty()) reevaluateQueue(layer, pIdx, this, true, true);
+                        if (!b.queue.empty()) {
+                            reevaluateQueue(layer, pIdx, this, true, true);
+                        }
                     } else {
                         performRealityCheck(layer, pIdx, dt);
                     }
@@ -2524,16 +2774,22 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
         for (int p = 0; p < 2; ++p) {
             if (g_buf[p].simulating) {
-                if (!g_buf[p].isGhost(player) || !object) return false;
+                if (!g_buf[p].isGhost(player) || !object) {
+                    return false;
+                }
                 auto& consumed = (player == g_buf[p].ghost1) ? g_buf[p].consumedP1 : g_buf[p].consumedP2;
-                if (consumed.contains(object)) return false;
+                if (consumed.contains(object)) {
+                    return false;
+                }
 
                 bool isSimulatingP1 = (p == 0 && player == g_buf[0].ghost1);
                 bool alreadyUsedByReal = object->m_isActivated ||
                                          (isSimulatingP1 ? object->m_activatedByPlayer1 : object->m_activatedByPlayer2) ||
                                          checkHasBeenActivated(static_cast<GameObject*>(object), isSimulatingP1) ||
                                          checkHasBeenActivated(object, isSimulatingP1);
-                if (alreadyUsedByReal && !isMultiActivateRing(object)) return false;
+                if (alreadyUsedByReal && !isMultiActivateRing(object)) {
+                    return false;
+                }
 
                 snapshotTarget(p, object);
 
@@ -2629,6 +2885,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             if (!isPortal && speed <= 0.0f) continue;
             if (!ghostOuterRect.intersectsRect(obj->getObjectRect())) continue;
 
+            // Ignore portals already triggered by the real player before this simulation started
             bool alreadyUsedPortal = (obj == player->m_lastActivatedPortal) ||
                                      obj->m_isActivated ||
                                      checkHasBeenActivated(obj, isSimulatingP1);
@@ -2664,7 +2921,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                     g_rhythm[pIdx].record(getPlayerMode(p), down, curTick);
                 }
             }
-            if (interceptInput(this, down, isPlayer1)) return;
+            if (interceptInput(this, down, isPlayer1)) {
+                return;
+            }
         }
 
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
