@@ -1,4 +1,4 @@
-// Click Before Frames — External Window Edition (Ultra-Optimized & Bug-Fixed)
+// Click Before Frames — External Window Edition (with v2.80 Functionality Fixes)
 // Zero in-game visual/audio footprint. Separate Win32 control window on launch.
 // Selectable ticks: 2, 4, 8, 16. All other settings locked to optimal configuration.
 
@@ -11,6 +11,7 @@
 #include <Geode/modify/LevelEditorLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
+#include <Geode/modify/RingObject.hpp>
 
 #include <Windows.h>
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -68,6 +70,12 @@ namespace {
         typeBit(GameObjectType::SpiderPortal) | typeBit(GameObjectType::SwingPortal) |
         typeBit(GameObjectType::DualPortal) | typeBit(GameObjectType::SoloPortal) |
         typeBit(GameObjectType::TeleportPortal) | typeBit(GameObjectType::TeleportOrb);
+
+    constexpr uint64_t MODE_TYPES =
+        typeBit(GameObjectType::ShipPortal) | typeBit(GameObjectType::CubePortal) |
+        typeBit(GameObjectType::BallPortal) | typeBit(GameObjectType::UfoPortal) |
+        typeBit(GameObjectType::WavePortal) | typeBit(GameObjectType::RobotPortal) |
+        typeBit(GameObjectType::SpiderPortal) | typeBit(GameObjectType::SwingPortal);
 
     constexpr uint64_t SIZE_TYPES =
         typeBit(GameObjectType::RegularSizePortal) | typeBit(GameObjectType::MiniSizePortal);
@@ -140,6 +148,8 @@ namespace {
         bool injecting = false;
         bool ghostDied = false;
         bool ghostHitPortal = false;
+        bool ghostSwitched = false;
+        bool haveStartRects = false;
         bool g1IsRealP2 = false;
 
         std::atomic<int> stageIndex { 1 }; // Default index 1 -> 4 ticks
@@ -150,10 +160,10 @@ namespace {
 
         float tickLength = TICK;
 
-        // Locked settings matching your screenshots:
+        // Locked settings matching your screenshots + v2.80 fixes:
         static constexpr bool smart = true;
-        static constexpr double userBudget = 5.0; // Strictly enforced global per-click budget
-        double budgetMs = 5.0;
+        static constexpr double userBudget = 6.0;
+        double budgetMs = 6.0;
         static constexpr bool autoBudget = true;
         static constexpr int groundHorizon = 130;
         static constexpr int waveHorizon = 80;
@@ -164,6 +174,7 @@ namespace {
         static constexpr int orbWindow = 4;
         static constexpr bool waveMargin = true;
         static constexpr bool fullState = true;
+        static constexpr bool portalPredict = true;
         static constexpr bool robotSmart = true;
         static constexpr bool learn = true;
         static constexpr bool spiderSmart = true;
@@ -206,7 +217,7 @@ namespace {
         bool captureBase = false;
         bool baseTouchedDown = false;
 
-        // Pre-reserved contiguous vectors (zero heap allocations during simulation)
+        // Pre-reserved contiguous vectors
         std::vector<ObjSnapshot> snapshots;
         std::vector<std::pair<GameObject*, uint8_t>> orbsUsed;
         std::vector<GameObject*> simDisabled;
@@ -348,17 +359,34 @@ namespace {
     }
 
     // -------------------------------------------------------------------------
-    // Core Physics & Scaling Helpers
+    // Core Physics, Timing & Scaling Helpers
     // -------------------------------------------------------------------------
     std::chrono::steady_clock::time_point clickStart;
+    bool clickTimed = false;
 
     inline double clickMs() {
-        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count();
+        return clickTimed
+            ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count()
+            : 0.0;
     }
 
-    inline bool outOfTime() {
-        return clickMs() >= buf.budgetMs;
+    inline bool clickOverTime() {
+        return clickMs() > buf.budgetMs * 1.25;
     }
+
+    inline double searchBudget() {
+        return clickTimed ? std::max(0.0, buf.budgetMs - clickMs()) : buf.budgetMs;
+    }
+
+    struct ClickTimer {
+        ClickTimer() {
+            clickStart = std::chrono::steady_clock::now();
+            clickTimed = true;
+        }
+        ~ClickTimer() {
+            clickTimed = false;
+        }
+    };
 
     float stepScale() {
         float dt = buf.tickLength;
@@ -396,11 +424,10 @@ namespace {
             double interval = director->getAnimationInterval() * 1000.0;
             double frame = director->getDeltaTime() * 1000.0;
             if (interval > 0.0) {
-                // Keep click time well inside one frame interval so high-FPS never stutters
-                budget = std::min(budget, std::clamp(interval * 0.75, 2.5, 5.0));
-                if (frame > std::max(interval * 1.8, 16.0)) {
-                    budget = std::min(budget, 2.2);
-                }
+                budget = std::min(budget, std::max(4.0, interval));
+            }
+            if (interval > 0.0 && frame > std::max(interval * 2.0, 20.0)) {
+                budget = std::min(budget, 4.0);
             }
         }
         buf.budgetMs = budget;
@@ -468,8 +495,60 @@ namespace {
         }
     }
 
+    // v2.79: switches the ghost's mode when hitting a mode portal during prediction
+    void setGhostMode(PlayerObject* ghost, GameObjectType type) {
+        using T = GameObjectType;
+        bool now = (type == T::ShipPortal && ghost->m_isShip) ||
+                   (type == T::BallPortal && ghost->m_isBall) ||
+                   (type == T::UfoPortal && ghost->m_isBird) ||
+                   (type == T::WavePortal && ghost->m_isDart) ||
+                   (type == T::RobotPortal && ghost->m_isRobot) ||
+                   (type == T::SpiderPortal && ghost->m_isSpider) ||
+                   (type == T::SwingPortal && ghost->m_isSwing) ||
+                   (type == T::CubePortal && !ghost->m_isShip && !ghost->m_isBall && !ghost->m_isBird &&
+                    !ghost->m_isDart && !ghost->m_isRobot && !ghost->m_isSpider && !ghost->m_isSwing);
+        if (now) {
+            return;
+        }
+        buf.ghostSwitched = true;
+        if (ghost->m_isShip) ghost->toggleFlyMode(false, true);
+        if (ghost->m_isBall) ghost->toggleRollMode(false, true);
+        if (ghost->m_isBird) ghost->toggleBirdMode(false, true);
+        if (ghost->m_isDart) ghost->toggleDartMode(false, true);
+        if (ghost->m_isRobot) ghost->toggleRobotMode(false, true);
+        if (ghost->m_isSpider) ghost->toggleSpiderMode(false, true);
+        if (ghost->m_isSwing) ghost->toggleSwingMode(false, true);
+        switch (type) {
+            case T::ShipPortal: ghost->toggleFlyMode(true, true); break;
+            case T::BallPortal: ghost->toggleRollMode(true, true); break;
+            case T::UfoPortal: ghost->toggleBirdMode(true, true); break;
+            case T::WavePortal: ghost->toggleDartMode(true, true); break;
+            case T::RobotPortal: ghost->toggleRobotMode(true, true); break;
+            case T::SpiderPortal: ghost->toggleSpiderMode(true, true); break;
+            case T::SwingPortal: ghost->toggleSwingMode(true, true); break;
+            default: break;
+        }
+    }
+
+    // Restores the ghost's mode back to the real player's mode if a previous run switched it
+    void syncGhostModeToReal(PlayerObject* ghost, PlayerObject* real) {
+        using T = GameObjectType;
+        T realType = real->m_isShip   ? T::ShipPortal
+                   : real->m_isBall   ? T::BallPortal
+                   : real->m_isBird   ? T::UfoPortal
+                   : real->m_isDart   ? T::WavePortal
+                   : real->m_isRobot  ? T::RobotPortal
+                   : real->m_isSpider ? T::SpiderPortal
+                   : real->m_isSwing  ? T::SwingPortal
+                                      : T::CubePortal;
+        bool savedSwitch = buf.ghostSwitched;
+        setGhostMode(ghost, realType);
+        buf.ghostSwitched = savedSwitch;
+    }
+
     void copyState(PlayerObject* ghost, PlayerObject* real) {
         ghost->setVisible(false);
+        syncGhostModeToReal(ghost, real);
         if (ghost->m_touchingRings && ghost->m_touchingRings->count() > 0) {
             ghost->m_touchingRings->removeAllObjects();
         }
@@ -707,7 +786,7 @@ namespace {
     }
 
     // -------------------------------------------------------------------------
-    // Per-Level Memory
+    // Per-Level Memory (with v2.79 Last-Working Delay Support)
     // -------------------------------------------------------------------------
     constexpr float SLICE = 15.f;
     constexpr int OUTCOME_TICKS = 90;
@@ -717,6 +796,7 @@ namespace {
         uint32_t bad = 0;
         uint32_t deaths = 0;
         uint32_t delaySum = 0;
+        uint32_t last = 0; // v2.79: exact delay that last worked at this spot (240/s)
     };
 
     std::unordered_map<int, Spot> memory;
@@ -759,7 +839,7 @@ namespace {
         std::filesystem::create_directories(memoryFile().parent_path(), ec);
         std::ofstream out(memoryFile(), std::ios::trunc);
         for (auto const& [slice, spot] : memory) {
-            out << slice << ' ' << spot.ok << ' ' << spot.bad << ' ' << spot.deaths << ' ' << spot.delaySum << '\n';
+            out << slice << ' ' << spot.ok << ' ' << spot.bad << ' ' << spot.deaths << ' ' << spot.delaySum << ' ' << spot.last << '\n';
         }
         memoryDirty = false;
     }
@@ -784,9 +864,15 @@ namespace {
         }
 
         std::ifstream in(memoryFile());
-        int slice;
-        Spot spot;
-        while (in >> slice >> spot.ok >> spot.bad >> spot.deaths >> spot.delaySum) {
+        std::string line;
+        while (std::getline(in, line)) {
+            std::istringstream fields(line);
+            int slice;
+            Spot spot;
+            if (!(fields >> slice >> spot.ok >> spot.bad >> spot.deaths >> spot.delaySum)) {
+                continue;
+            }
+            fields >> spot.last;
             memory[slice] = spot;
         }
 
@@ -798,6 +884,9 @@ namespace {
                 uint32_t ok = s.ok * 3 / 4;
                 s.delaySum = s.ok > 0 ? static_cast<uint32_t>(static_cast<uint64_t>(s.delaySum) * ok / s.ok) : 0;
                 s.ok = ok;
+                if (ok == 0) {
+                    s.last = 0;
+                }
                 s.bad = s.bad * 3 / 4;
                 s.deaths = s.deaths * 3 / 4;
                 it = (s.ok | s.bad | s.deaths) == 0 ? memory.erase(it) : std::next(it);
@@ -819,8 +908,13 @@ namespace {
         pending.active = false;
         if (pending.delay > 0) {
             auto& spot = memory[pending.slice];
+            auto delay = static_cast<uint32_t>(std::lround(pending.delay / stepScale()));
             ++spot.ok;
-            spot.delaySum += static_cast<uint32_t>(std::lround(pending.delay / stepScale()));
+            spot.delaySum += delay;
+            spot.last = delay;
+            if (spot.bad > 0) {
+                --spot.bad;
+            }
             memoryChanged();
         }
     }
@@ -868,6 +962,12 @@ namespace {
     }
 
     int memoryDelay(int slice) {
+        for (int sl : { slice, slice - 1, slice + 1 }) {
+            auto it = memory.find(sl);
+            if (it != memory.end() && it->second.last > 0) {
+                return st(static_cast<int>(it->second.last));
+            }
+        }
         auto spot = spotAround(slice);
         if (spot.ok < 2) return 0;
         return st(static_cast<int>(std::lround(static_cast<double>(spot.delaySum) / spot.ok)));
@@ -999,6 +1099,7 @@ namespace {
         buf.simulating = true;
         buf.ghostDied = false;
         buf.ghostHitPortal = false;
+        buf.ghostSwitched = false;
         buf.firstOrbTick = -1;
         buf.lastOrbTick = -1;
         buf.laterOrbTouched = false;
@@ -1007,11 +1108,10 @@ namespace {
 
         bool second = dual && buf.ghost2 && p2;
         buf.haveRealRect = Buffer::ignoreTouching;
+        buf.haveStartRects = true;
         buf.harmless.clear();
-        if (buf.haveRealRect) {
-            buf.realRect1 = p1->getObjectRect();
-            buf.realRect2 = second ? p2->getObjectRect() : buf.realRect1;
-        }
+        buf.realRect1 = p1->getObjectRect();
+        buf.realRect2 = second ? p2->getObjectRect() : buf.realRect1;
 
         copyState(buf.ghost1, p1);
         if (second) {
@@ -1127,7 +1227,8 @@ namespace {
             if (survived >= stopAt) {
                 break;
             }
-            if (!hasGroundPlayer) {
+            // v2.79: if a portal switched the ghost's mode, require surviving the full look-ahead
+            if (!hasGroundPlayer || buf.ghostSwitched) {
                 continue;
             }
 
@@ -1178,6 +1279,12 @@ namespace {
             *end = SimEnd::StopSearch;
         }
         restoreObjects();
+        if (buf.firstOrbTick >= 0) {
+            buf.ghost1->stopParticles();
+            if (buf.ghost2) {
+                buf.ghost2->stopParticles();
+            }
+        }
         buf.simulating = false;
         return safe ? horizon : survived;
     }
@@ -1189,7 +1296,7 @@ namespace {
         buf.orbClick = Buffer::assumeOrbs;
         buf.touchedOrb = false;
         int first = simulate(layer, p1, p2, dual, initialHeld, delay, down, horizon, releaseAfter, stopAt, end);
-        if (fastSubCheck || !Buffer::tryBothOrbs || !buf.touchedOrb || first >= stopAt || outOfTime()) {
+        if (fastSubCheck || !Buffer::tryBothOrbs || !buf.touchedOrb || first >= stopAt || clickOverTime()) {
             return first;
         }
         SimEnd firstEnd = *end;
@@ -1200,9 +1307,8 @@ namespace {
             *end = SimEnd::Ok;
         }
         int best = std::max(first, second);
-        if (!quickScore && Buffer::orbTiming && best < stopAt && !outOfTime()) {
+        if (!quickScore && Buffer::orbTiming && best < stopAt && !clickOverTime()) {
             for (int late : { 3, 6 }) {
-                if (outOfTime()) break;
                 buf.orbClick = true;
                 buf.orbClickDelay = st(late);
                 SimEnd lateEnd;
@@ -1210,7 +1316,7 @@ namespace {
                 buf.orbClickDelay = 0;
                 buf.orbClick = Buffer::assumeOrbs;
                 best = std::max(best, ret);
-                if (best >= stopAt) {
+                if (best >= stopAt || clickOverTime()) {
                     break;
                 }
             }
@@ -1223,6 +1329,7 @@ namespace {
         return st(mini ? std::max(20, wh - 15) : wh);
     }
 
+    // v2.79: updated orb alignment with `bestAt = k + ret` (ORBIT fix) and outward mid scan
     int alignOrb(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int horizon, int releaseAfter, int learned, int maxDelay, int* landed) {
         int window = st(Buffer::orbWindow); // 4 ticks
@@ -1242,7 +1349,7 @@ namespace {
         auto tryAt = [&](int k, bool* used) {
             int best = -1;
             *used = false;
-            for (int late : { 0, 3, 6 }) {
+            for (int late : { 0, 3, 6, 10 }) {
                 buf.orbClickDelay = st(late);
                 int ret = simulate(layer, p1, p2, dual, initialHeld, k, true, horizon, releaseAfter, horizon, &end);
                 buf.orbClickDelay = 0;
@@ -1250,7 +1357,7 @@ namespace {
                     *used = buf.orbUsedTick >= 0;
                 }
                 best = std::max(best, ret);
-                if (ret >= horizon || buf.orbUsedTick < 0 || !buf.laterOrbTouched || end == SimEnd::StopSearch || outOfTime()) {
+                if (ret >= horizon || buf.orbUsedTick < 0 || !buf.laterOrbTouched || !Buffer::orbTiming || end == SimEnd::StopSearch) {
                     break;
                 }
             }
@@ -1258,9 +1365,9 @@ namespace {
         };
 
         auto robustAt = [&](int k) {
+            if (!Buffer::robustSaves) return true;
             float shift = std::max(0.3f, 0.5f * (311.58f / 240.f) * (std::abs(p1->m_playerSpeed) / 0.9f));
             for (float off : { shift, -shift }) {
-                if (outOfTime()) return true;
                 buf.ghostShiftX = off;
                 bool used;
                 int ret = tryAt(k, &used);
@@ -1283,7 +1390,7 @@ namespace {
 
         buf.skipPress = true;
         buf.orbAfterFirst = false;
-        int probeLen = std::min(maxDelay, std::max(window, st(20))) + 2;
+        int probeLen = std::min(maxDelay, std::max(window, st(40))) + 2;
         simulate(layer, p1, p2, dual, initialHeld, 0, true, probeLen, -1, probeLen, &end);
         buf.skipPress = false;
         buf.orbAfterFirst = true;
@@ -1295,7 +1402,7 @@ namespace {
 
         bool nowUsed;
         int now = tryAt(0, &nowUsed);
-        if (nowUsed && now >= horizon) {
+        if (nowUsed && (now >= horizon || !Buffer::orbTiming)) {
             return 0;
         }
 
@@ -1303,9 +1410,11 @@ namespace {
         int to = std::min(maxDelay, std::max(leave, touch + st(6)));
         int safeStart = -1, safeEnd = -1;
         int bestRet = -1, bestK = 0;
+        int bestAt = -1;
+        double orbBudget = buf.budgetMs * 1.75;
 
         for (int k = from; k <= to; ++k) {
-            if (outOfTime()) break;
+            if (clickMs() > orbBudget) break;
             bool used;
             int ret = tryAt(k, &used);
             if (end == SimEnd::StopSearch) break;
@@ -1319,7 +1428,8 @@ namespace {
             } else if (safeStart >= 0) {
                 break;
             }
-            if (ret > bestRet) {
+            if (k + ret > bestAt) {
+                bestAt = k + ret;
                 bestRet = ret;
                 bestK = k;
             }
@@ -1328,29 +1438,34 @@ namespace {
         if (safeStart >= 0) {
             int mid = (safeStart + safeEnd) / 2;
             found = mid;
-            if (!outOfTime() && robustAt(mid)) {
-                found = mid;
+            for (int off = 0; off <= safeEnd - safeStart; ++off) {
+                int k = off % 2 == 0 ? mid + off / 2 : mid - (off + 1) / 2;
+                if (k < safeStart || k > safeEnd) continue;
+                if (clickMs() > buf.budgetMs * 2.0 || robustAt(k)) {
+                    found = k;
+                    break;
+                }
             }
             *landed = horizon;
-        } else if (bestK > 0 && bestRet >= std::min(horizon, std::max(now, 0) + st(12))) {
+        } else if (bestK > 0 && bestAt >= std::max(now, 0) + st(12)) {
             found = bestK;
             *landed = bestRet;
         }
         return found;
     }
 
-    constexpr int WAVE_TURN_MARGINS[] = { 4, 10 };
+    constexpr int WAVE_TURN_MARGINS[] = { 4, 8, 12 };
     constexpr int WAVE_MIN_TURN = 6;
     constexpr int WAVE_ESCAPE = 16;
 
     int waveScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, bool down, int horizon, int target, SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, down, horizon, -1, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch || outOfTime()) {
+        if (ret >= target || *end == SimEnd::StopSearch || clickOverTime()) {
             return ret;
         }
         for (int margin : WAVE_TURN_MARGINS) {
-            if (outOfTime()) break;
+            if (clickOverTime()) break;
             int turnAt = ret - st(margin);
             if (turnAt < st(WAVE_MIN_TURN)) break;
             int length = std::min(horizon, turnAt + st(WAVE_ESCAPE));
@@ -1363,7 +1478,7 @@ namespace {
         return ret;
     }
 
-    constexpr int ROBOT_HOLDS[] = { 6, 14, 28, 45 };
+    constexpr int ROBOT_HOLDS[] = { 6, 14, 26, 45 };
     int robotUsedHold = -1;
 
     int robotScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
@@ -1371,11 +1486,11 @@ namespace {
         int usual = robotHold.pick(st(20), 50);
         int best = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, horizon, usual, target, end);
         robotUsedHold = usual;
-        if (best >= target || *end == SimEnd::StopSearch || quickScore || outOfTime()) {
+        if (best >= target || *end == SimEnd::StopSearch || quickScore || clickOverTime()) {
             return best;
         }
         for (int hold : ROBOT_HOLDS) {
-            if (outOfTime()) break;
+            if (clickOverTime()) break;
             if (std::abs(st(hold) - usual) < st(3)) continue;
             SimEnd e;
             int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, horizon, st(hold), target, &e, true);
@@ -1388,17 +1503,17 @@ namespace {
         return best;
     }
 
-    constexpr int SPIDER_RETAP[] = { 4, 10 };
+    constexpr int SPIDER_RETAP[] = { 4, 8, 12 };
     constexpr int SPIDER_MIN_RETAP = 4;
 
     int spiderScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, int horizon, int releaseAfter, int target, SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, horizon, releaseAfter, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch || quickScore || outOfTime()) {
+        if (ret >= target || *end == SimEnd::StopSearch || quickScore || clickOverTime()) {
             return ret;
         }
         for (int margin : SPIDER_RETAP) {
-            if (outOfTime()) break;
+            if (clickOverTime()) break;
             int at = ret - st(margin);
             if (at < st(SPIDER_MIN_RETAP)) break;
             int length = std::min(horizon, at + st(16));
@@ -1425,12 +1540,14 @@ namespace {
     }
 
     int searchSmallest(int horizon, int maxDelay, int base, int* landed,
-        std::function<int(int, int, SimEnd*)> const& score, double maxElapsedMs = -1.0, bool needFull = false) {
-        if (maxElapsedMs < 0.0) maxElapsedMs = buf.budgetMs;
+        std::function<int(int, int, SimEnd*)> const& score, double budget = -1.0, bool needFull = false) {
+        if (budget < 0.0) budget = buf.budgetMs;
+        budget = std::min(budget, searchBudget());
+        using clock = std::chrono::steady_clock;
+        auto start = clock::now();
         int target = needFull ? horizon : std::min(horizon, base + st(12));
         int streak = 0;
         for (int k = 1; k <= maxDelay; ++k) {
-            if (clickMs() >= maxElapsedMs) return 0;
             SimEnd end;
             int ret = score(k, target, &end);
             if (end == SimEnd::StopSearch) return 0;
@@ -1439,6 +1556,9 @@ namespace {
                 return k;
             }
             if (sameCrash(k, ret, base, streak)) return 0;
+            if (std::chrono::duration<double, std::milli>(clock::now() - start).count() > budget) {
+                return 0;
+            }
         }
         return 0;
     }
@@ -1446,22 +1566,24 @@ namespace {
     int searchTwoPass(int horizon, int maxDelay, int base, int* landed,
         std::function<int(int, int, SimEnd*)> const& score, bool needFull = false) {
         quickScore = true;
-        int k = searchSmallest(horizon, maxDelay, base, landed, score, buf.budgetMs * 0.6, needFull);
+        int k = searchSmallest(horizon, maxDelay, base, landed, score, searchBudget() * 0.5, needFull);
         quickScore = false;
-        if (k > 0 || outOfTime()) return k;
-        return searchSmallest(horizon, maxDelay, base, landed, score, buf.budgetMs, needFull);
+        if (k > 0) return k;
+        double left = buf.budgetMs - clickMs();
+        if (left < 0.5) return 0;
+        return searchSmallest(horizon, maxDelay, base, landed, score, left, needFull);
     }
 
-    constexpr int SHIP_RECOVER[] = { 8, 18 };
+    constexpr int SHIP_RECOVER[] = { 8, 16, 24 };
 
     int shipScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, bool down, int horizon, int target, SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, down, horizon, -1, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch || outOfTime()) {
+        if (ret >= target || *end == SimEnd::StopSearch || clickOverTime()) {
             return ret;
         }
         for (int margin : SHIP_RECOVER) {
-            if (outOfTime()) break;
+            if (clickOverTime()) break;
             int turnAt = ret - st(margin);
             if (turnAt < st(WAVE_MIN_TURN)) break;
             int length = std::min(horizon, turnAt + st(WAVE_ESCAPE));
@@ -1474,16 +1596,16 @@ namespace {
         return ret;
     }
 
-    constexpr int UFO_REFLAP[] = { 6, 14 };
+    constexpr int UFO_REFLAP[] = { 6, 12, 18 };
 
     int ufoScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, int horizon, int releaseAfter, int target, SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, horizon, releaseAfter, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch || quickScore || outOfTime()) {
+        if (ret >= target || *end == SimEnd::StopSearch || quickScore || clickOverTime()) {
             return ret;
         }
         for (int margin : UFO_REFLAP) {
-            if (outOfTime()) break;
+            if (clickOverTime()) break;
             int at = ret - st(margin);
             if (at < st(4)) break;
             int length = std::min(horizon, at + st(20));
@@ -1500,23 +1622,27 @@ namespace {
 
     int searchWave(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         bool down, int horizon, int maxDelay, int base, int* landed) {
+        using clock = std::chrono::steady_clock;
+        auto start = clock::now();
+        double budget = searchBudget();
         int target = std::min(horizon, base + st(12));
         for (int k = 1; k <= maxDelay; ++k) {
-            if (outOfTime()) return 0;
             SimEnd end;
             int ret = waveScore(layer, p1, p2, dual, initialHeld, k, down, horizon, target, &end);
             if (end == SimEnd::StopSearch) return 0;
             if (ret >= target) {
                 *landed = ret;
-                if (Buffer::waveMargin && k + 2 <= maxDelay && !outOfTime()) {
+                if (Buffer::waveMargin && k + 2 <= maxDelay && !clickOverTime()) {
                     SimEnd e1, e2;
                     if (waveScore(layer, p1, p2, dual, initialHeld, k + 1, down, horizon, target, &e1) >= target &&
-                        !outOfTime() &&
                         waveScore(layer, p1, p2, dual, initialHeld, k + 2, down, horizon, target, &e2) >= target) {
                         return k + 1;
                     }
                 }
                 return k;
+            }
+            if (std::chrono::duration<double, std::milli>(clock::now() - start).count() > budget) {
+                return 0;
             }
         }
         return 0;
@@ -1524,19 +1650,25 @@ namespace {
 
     int searchDelay(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         bool down, int horizon, int maxDelay, int releaseAfter, int base, int* landed, bool needFull = false) {
+        using clock = std::chrono::steady_clock;
+        auto start = clock::now();
+        double budget = searchBudget();
+        auto overBudget = [&] {
+            return std::chrono::duration<double, std::milli>(clock::now() - start).count() > budget;
+        };
+
         int target = needFull ? horizon : std::min(horizon, base + st(12));
         int sameStreak = 0;
         for (int k = 1; k <= maxDelay; ++k) {
-            if (outOfTime()) break;
             SimEnd end;
             int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, k, down, horizon, releaseAfter, target, &end);
             if (end == SimEnd::StopSearch) break;
             if (ret < target && sameCrash(k, ret, base, sameStreak)) break;
             if (ret >= target) {
                 SimEnd full;
-                if (ret < horizon && !outOfTime() &&
+                if (ret < horizon && !overBudget() &&
                     simulateOrbs(layer, p1, p2, dual, initialHeld, k, down, horizon, releaseAfter, horizon, &full) < horizon) {
-                    for (int j = k + 1; j <= maxDelay && !outOfTime(); ++j) {
+                    for (int j = k + 1; j <= maxDelay && !overBudget(); ++j) {
                         SimEnd e;
                         int r = simulateOrbs(layer, p1, p2, dual, initialHeld, j, down, horizon, releaseAfter, horizon, &e);
                         if (e == SimEnd::StopSearch) break;
@@ -1549,6 +1681,7 @@ namespace {
                 *landed = ret;
                 return k;
             }
+            if (overBudget()) break;
         }
         return 0;
     }
@@ -1557,7 +1690,7 @@ namespace {
     // Input Interception & Queue Delivery (Full 1P, Dual, and 2-Player Support)
     // -------------------------------------------------------------------------
     bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
-        clickStart = std::chrono::steady_clock::now();
+        ClickTimer timer;
         clickBudget();
         auto* layer = GameManager::get()->m_playLayer;
         if (!layer || layer->m_isPlatformer) {
@@ -1730,7 +1863,7 @@ namespace {
                                  : simulateOrbs(layer, p1, p2, simDual, initialHeld, 0, down, horizon, releaseAfter, horizon, &end);
         buf.captureBase = false;
 
-        if (base >= horizon || outOfTime()) {
+        if (base >= horizon || clickOverTime()) {
             memoryNote(p1, 0);
             ch.appliedInput = down;
             return false;
@@ -1764,7 +1897,7 @@ namespace {
 
         int needed = (groundPress || robotPress || ufoPress) ? horizon : std::min(horizon, base + st(12));
         int learned = memoryDelay(slice);
-        if (learned > 0 && learned <= maxDelay && !outOfTime()) {
+        if (learned > 0 && learned <= maxDelay && !clickOverTime()) {
             SimEnd e;
             int ret = scoreAt(learned, needed, &e);
             if (ret >= needed) {
@@ -1773,7 +1906,7 @@ namespace {
             }
         }
 
-        if (saved <= 0 && !outOfTime()) {
+        if (saved <= 0 && !clickOverTime()) {
             saved = cubeStyleWave ? searchWave(layer, p1, p2, simDual, initialHeld, down, horizon, maxDelay, base, &landed)
                   : robotPress    ? searchTwoPass(horizon, maxDelay, base, &landed, [&](int k, int target, SimEnd* e) {
                         return robotScore(layer, p1, p2, simDual, initialHeld, k, horizon, target, e);
@@ -1796,11 +1929,10 @@ namespace {
             return false;
         }
 
-        if (Buffer::robustSaves && !outOfTime()) {
+        if (Buffer::robustSaves) {
             float shift = std::max(0.3f, 0.5f * (311.58f / 240.f) * (std::abs(p1->m_playerSpeed) / 0.9f));
             auto robust = [&](int k) {
                 for (float off : { shift, -shift }) {
-                    if (outOfTime()) return true;
                     buf.ghostShiftX = off;
                     SimEnd e;
                     int ret = scoreAt(k, needed, &e);
@@ -1809,8 +1941,8 @@ namespace {
                 }
                 return true;
             };
-            if (!robust(saved)) {
-                for (int k = saved + 1; k <= std::min(maxDelay, saved + st(3)) && !outOfTime(); ++k) {
+            if (clickMs() < buf.budgetMs && !robust(saved)) {
+                for (int k = saved + 1; k <= std::min(maxDelay, saved + st(3)) && !clickOverTime(); ++k) {
                     SimEnd e;
                     int ret = scoreAt(k, needed, &e);
                     if (ret >= needed && robust(k)) {
@@ -1880,6 +2012,7 @@ class $modify(BufPlayLayer, PlayLayer) {
     static void onModify(auto& self) {
         (void)self.setHookPriority("PlayLayer::destroyPlayer", HOOK_PRIORITY);
         (void)self.setHookPriority("PlayLayer::playEndAnimationToPos", HOOK_PRIORITY);
+        (void)self.setHookPriority("PlayLayer::spawnCircle", HOOK_PRIORITY);
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
@@ -1929,6 +2062,11 @@ class $modify(BufPlayLayer, PlayLayer) {
         if (buf.simulating) return;
         PlayLayer::playEndAnimationToPos(position);
     }
+
+    void spawnCircle() {
+        if (buf.simulating) return;
+        PlayLayer::spawnCircle();
+    }
 };
 
 class $modify(BufEditorLayer, LevelEditorLayer) {
@@ -1959,6 +2097,11 @@ class $modify(BufEffectGameObject, EffectGameObject) {
         if (buf.simulating) return;
         EffectGameObject::triggerObject(layer, uniqueID, remapKeys);
     }
+
+    void playTriggerEffect() {
+        if (buf.simulating) return;
+        EffectGameObject::playTriggerEffect();
+    }
 };
 
 class $modify(BufGameObject, GameObject) {
@@ -1969,6 +2112,33 @@ class $modify(BufGameObject, GameObject) {
     void playShineEffect() {
         if (buf.simulating) return;
         GameObject::playShineEffect();
+    }
+
+    void playDestroyObjectAnim(GJBaseGameLayer* layer) {
+        if (buf.simulating) return;
+        GameObject::playDestroyObjectAnim(layer);
+    }
+};
+
+class $modify(BufRingObject, RingObject) {
+    static void onModify(auto& self) {
+        (void)self.setHookPriority("RingObject::powerOnObject", HOOK_PRIORITY);
+        (void)self.setHookPriority("RingObject::spawnCircle", HOOK_PRIORITY);
+    }
+
+    void powerOnObject(int state) {
+        if (buf.simulating) return;
+        RingObject::powerOnObject(state);
+    }
+
+    void spawnCircle() {
+        if (buf.simulating) return;
+        RingObject::spawnCircle();
+    }
+
+    void triggerActivated(float xPosition) {
+        if (buf.simulating) return;
+        RingObject::triggerActivated(xPosition);
     }
 };
 
@@ -2155,7 +2325,6 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                 continue;
             }
 
-            // Fast register-level spatial culling before expensive virtual rect/collision checks
             double const dx = std::abs(object->m_positionX - gx);
             if (dx > 85.0 && object->m_width <= 60.f) {
                 continue;
@@ -2200,6 +2369,20 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             }
             if (ghostRect.intersectsRect(object->getObjectRect())) {
                 if (stop) {
+                    if (!buf.harmless.empty() && vecContains(buf.harmless, object)) {
+                        continue;
+                    }
+                    auto const& r = object->getObjectRect();
+                    if (buf.haveStartRects && buf.simTick <= 1 && object->m_objectType != GameObjectType::TeleportOrb &&
+                        (r.intersectsRect(buf.realRect1) || r.intersectsRect(buf.realRect2))) {
+                        buf.harmless.push_back(object);
+                        continue;
+                    }
+                    if (Buffer::portalPredict && Buffer::fullState && (MODE_TYPES & bit)) {
+                        setGhostMode(player, object->m_objectType);
+                        buf.harmless.push_back(object);
+                        continue;
+                    }
                     buf.ghostHitPortal = true;
                 } else if (size) {
                     bool mini = object->m_objectType == GameObjectType::MiniSizePortal;
