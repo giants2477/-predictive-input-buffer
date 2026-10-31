@@ -1,5 +1,5 @@
-// Click Before Frames — External Window Edition (Maximum FPS & Zero-Stutter Build)
-// Zero in-game visual/audio footprint. Separate Win32 control window with live save status.
+// Click Before Frames — External Window Edition (Pure Physics, Zero Saving, Sub-Millisecond Build)
+// Zero in-game visual/audio footprint. Zero disk I/O. Separate Win32 control window.
 // Selectable ticks: 2, 4, 8, 16.
 
 #include <Geode/Geode.hpp>
@@ -20,14 +20,9 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
-#include <filesystem>
-#include <fstream>
 #include <functional>
-#include <mutex>
-#include <sstream>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 using namespace geode::prelude;
@@ -35,7 +30,7 @@ using namespace geode::prelude;
 namespace {
     constexpr int HOOK_PRIORITY = -1000000;
     constexpr float TICK = 0.25f;
-    constexpr int SPIDER_LAND = 12;
+    constexpr int SPIDER_LAND = 10;
     constexpr int SPAM_STREAK = 3;
 
     constexpr int ALLOWED_TICKS[4] = { 2, 4, 8, 16 };
@@ -45,8 +40,6 @@ namespace {
         return 1ull << static_cast<int>(type);
     }
 
-    // Includes GameObjectType::Special so D-Blocks (wave slide), S-Blocks (dash stop),
-    // J-Blocks, H-Blocks, and 2.2 F-Blocks work accurately during ghost simulations.
     constexpr uint64_t COLLIDING_TYPES =
         typeBit(GameObjectType::Solid) | typeBit(GameObjectType::Hazard) |
         typeBit(GameObjectType::Slope) | typeBit(GameObjectType::CollisionObject) |
@@ -153,7 +146,7 @@ namespace {
         bool haveStartRects = false;
         bool g1IsRealP2 = false;
 
-        std::atomic<int> stageIndex { 1 }; // Default index 1 -> 4 ticks
+        std::atomic<int> stageIndex { 1 }; // Default: 4 ticks
         std::atomic<int> ticksAll { 4 };
         std::atomic<int> ticksWave { 4 };
         std::atomic<int> totalSaves { 0 };
@@ -162,32 +155,22 @@ namespace {
 
         float tickLength = TICK;
 
-        // Locked settings tuned for zero frame drops + full accuracy
-        static constexpr bool smart = true;
-        static constexpr double userBudget = 3.5; // Hard frame-safe cap (16 ticks finishes in ~1.5ms with fast culling)
-        double budgetMs = 3.5;
-        static constexpr bool autoBudget = true;
-        static constexpr int groundHorizon = 130;
-        static constexpr int waveHorizon = 80;
+        // Sub-millisecond tuned constants for butter-smooth frame pacing
+        static constexpr double budgetMs = 1.0; // Never spend more than 1.0 ms on a click
+        static constexpr int groundHorizon = 95;
+        static constexpr int waveHorizon = 56;
         static constexpr bool assumeOrbs = true;
         static constexpr bool tryBothOrbs = true;
         static constexpr int spamGap = 24;
         static constexpr bool orbAlign = true;
         static constexpr int orbWindow = 16;
-        static constexpr bool waveMargin = true;
-        static constexpr bool fullState = true;
         static constexpr bool portalPredict = true;
-        static constexpr bool robotSmart = true;
-        static constexpr bool learn = true;
         static constexpr bool spiderSmart = true;
         static constexpr bool shipBuffer = true;
         static constexpr int shipMaxDelay = 4;
-        static constexpr bool orbTiming = true;
-        static constexpr int lateCrash = 90;
-        static constexpr bool robustSaves = true;
+        static constexpr int lateCrash = 80;
         static constexpr bool ignoreTouching = true;
         static constexpr bool cbfSync = true;
-        static constexpr bool lowLatencyQueue = false;
         static constexpr bool ufoSmart = true;
         static constexpr int shipSpamGap = 12;
         static constexpr bool ballSmart = true;
@@ -197,14 +180,11 @@ namespace {
         bool held1 = false, held2 = false;
         bool auto1 = false, auto2 = false;
         int autoHold1 = 0, autoHold2 = 0;
-        int orbClickDelay = 0;
-        int autoAt1 = -1, autoAt2 = -1;
         bool orbClick = true;
         bool touchedOrb = false;
         bool skipPress = false;
         bool haveRealRect = false;
         CCRect realRect1, realRect2;
-        float ghostShiftX = 0.f;
         float firstStep = 1.f;
         bool inRealUpdate = false;
         float tickStartCoord[2] = { 0.f, 0.f };
@@ -215,7 +195,6 @@ namespace {
         int firstOrbTick = -1;
         int lastOrbTick = -1;
         bool orbAfterFirst = false;
-        bool laterOrbTouched = false;
         int orbUsedTick = -1;
         bool captureBase = false;
         bool baseTouchedDown = false;
@@ -233,29 +212,24 @@ namespace {
     }
 
     // -------------------------------------------------------------------------
-    // External Win32 GUI Window (2, 4, 8, 16 Ticks + Live Save Feed)
+    // External Win32 GUI Window (100% Lock-Free Main-Thread Messaging)
     // -------------------------------------------------------------------------
     std::atomic<HWND> g_extHwnd { nullptr };
     HWND g_radioBtns[4] = {};
     HWND g_statusLabel = nullptr;
     HWND g_saveLabel = nullptr;
-    std::mutex g_statusMutex;
-    std::string g_lastSaveText = "Saves: 0 | Ready";
 
     constexpr UINT WM_APP_SYNC_STAGE = WM_APP + 1;
     constexpr UINT WM_APP_SYNC_SAVE  = WM_APP + 2;
 
-    void setStageByIndex(int idx, bool saveToDisk = true);
+    void setStageByIndex(int idx);
 
-    void notifyExternalSave(int delayTicks, char const* kind, bool down) {
-        int total = ++buf.totalSaves;
-        {
-            std::lock_guard<std::mutex> lock(g_statusMutex);
-            g_lastSaveText = fmt::format("Saves: {} | Last: {} {} +{}t ({:g}f)",
-                total, kind, down ? "press" : "rel", delayTicks, delayTicks * TICK);
-        }
-        if (HWND hwnd = g_extHwnd.load()) {
-            PostMessageA(hwnd, WM_APP_SYNC_SAVE, 0, 0);
+    inline void notifyExternalSave(int delayTicks, bool isOrb, bool down) {
+        int total = buf.totalSaves.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (HWND hwnd = g_extHwnd.load(std::memory_order_relaxed)) {
+            WPARAM wp = static_cast<WPARAM>(total);
+            LPARAM lp = static_cast<LPARAM>((delayTicks & 0xFFFF) | (isOrb ? (1 << 16) : 0) | (down ? (1 << 17) : 0));
+            PostMessageA(hwnd, WM_APP_SYNC_SAVE, wp, lp);
         }
     }
 
@@ -301,7 +275,7 @@ namespace {
             case WM_COMMAND: {
                 int id = LOWORD(wParam);
                 if (id >= 100 && id < 104 && HIWORD(wParam) == BN_CLICKED) {
-                    setStageByIndex(id - 100, true);
+                    setStageByIndex(id - 100);
                 }
                 return 0;
             }
@@ -320,12 +294,13 @@ namespace {
             }
             case WM_APP_SYNC_SAVE: {
                 if (g_saveLabel) {
-                    std::string copy;
-                    {
-                        std::lock_guard<std::mutex> lock(g_statusMutex);
-                        copy = g_lastSaveText;
-                    }
-                    SetWindowTextA(g_saveLabel, copy.c_str());
+                    int total = static_cast<int>(wParam);
+                    int delayTicks = static_cast<int>(lParam & 0xFFFF);
+                    bool isOrb = (lParam & (1 << 16)) != 0;
+                    bool down = (lParam & (1 << 17)) != 0;
+                    auto txt = fmt::format("Saves: {} | Last: {} {} +{}t ({:g}f)",
+                        total, isOrb ? "ORB" : "SAVED", down ? "press" : "rel", delayTicks, delayTicks * TICK);
+                    SetWindowTextA(g_saveLabel, txt.c_str());
                 }
                 return 0;
             }
@@ -360,10 +335,10 @@ namespace {
             );
 
             if (hwnd) {
-                g_extHwnd.store(hwnd);
+                g_extHwnd.store(hwnd, std::memory_order_relaxed);
                 ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 UpdateWindow(hwnd);
-                PostMessageA(hwnd, WM_APP_SYNC_STAGE, buf.stageIndex.load(), 0);
+                PostMessageA(hwnd, WM_APP_SYNC_STAGE, buf.stageIndex.load(std::memory_order_relaxed), 0);
 
                 MSG msg;
                 while (GetMessageA(&msg, nullptr, 0, 0) > 0) {
@@ -374,54 +349,34 @@ namespace {
         }).detach();
     }
 
-    void setStageByIndex(int idx, bool saveToDisk) {
+    void setStageByIndex(int idx) {
         idx = std::clamp(idx, 0, STAGE_COUNT - 1);
-        buf.stageIndex.store(idx);
+        buf.stageIndex.store(idx, std::memory_order_relaxed);
         int ticks = ALLOWED_TICKS[idx];
-        buf.ticksAll.store(ticks);
-        buf.ticksWave.store(ticks);
-        if (saveToDisk) {
-            Mod::get()->setSavedValue("stage-idx-locked", idx);
-        }
-        if (HWND hwnd = g_extHwnd.load()) {
+        buf.ticksAll.store(ticks, std::memory_order_relaxed);
+        buf.ticksWave.store(ticks, std::memory_order_relaxed);
+        if (HWND hwnd = g_extHwnd.load(std::memory_order_relaxed)) {
             PostMessageA(hwnd, WM_APP_SYNC_STAGE, idx, 0);
         }
     }
 
     void cycleStage() {
-        int nextIdx = (buf.stageIndex.load() + 1) % STAGE_COUNT;
-        setStageByIndex(nextIdx, true);
+        int nextIdx = (buf.stageIndex.load(std::memory_order_relaxed) + 1) % STAGE_COUNT;
+        setStageByIndex(nextIdx);
     }
 
     // -------------------------------------------------------------------------
     // Core Physics, Timing & Scaling Helpers
     // -------------------------------------------------------------------------
     std::chrono::steady_clock::time_point clickStart;
-    bool clickTimed = false;
 
     inline double clickMs() {
-        return clickTimed
-            ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count()
-            : 0.0;
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count();
     }
 
     inline bool clickOverTime() {
-        return clickMs() >= buf.budgetMs;
+        return clickMs() >= Buffer::budgetMs;
     }
-
-    inline double searchBudget() {
-        return clickTimed ? std::max(0.0, buf.budgetMs - clickMs()) : buf.budgetMs;
-    }
-
-    struct ClickTimer {
-        ClickTimer() {
-            clickStart = std::chrono::steady_clock::now();
-            clickTimed = true;
-        }
-        ~ClickTimer() {
-            clickTimed = false;
-        }
-    };
 
     float stepScale() {
         float dt = buf.tickLength;
@@ -445,27 +400,6 @@ namespace {
     float travelCoord(PlayerObject* p) {
         auto pos = p->getPosition();
         return p->m_isSideways ? pos.y : pos.x;
-    }
-
-    void resetAllPending() {
-        buf.chan[0].resetPending();
-        buf.chan[1].resetPending();
-    }
-
-    void clickBudget() {
-        double budget = Buffer::userBudget; // 3.5 ms max
-        if (Buffer::autoBudget) {
-            auto* director = CCDirector::get();
-            double interval = director->getAnimationInterval() * 1000.0;
-            double frame = director->getDeltaTime() * 1000.0;
-            if (interval > 0.0) {
-                budget = std::min(budget, std::clamp(interval * 0.75, 2.2, 3.5));
-                if (frame > std::max(interval * 1.6, 14.0)) {
-                    budget = std::min(budget, 1.8);
-                }
-            }
-        }
-        buf.budgetMs = budget;
     }
 
     int tickCount = 0;
@@ -612,17 +546,9 @@ namespace {
         ghost->m_lastActivatedPortal = real->m_lastActivatedPortal;
 
         CCPoint pos = real->getPosition();
-        CCPoint lastPos = real->m_lastPosition;
-        if (real->m_isSideways) {
-            pos.y += buf.ghostShiftX;
-            lastPos.y += buf.ghostShiftX;
-        } else {
-            pos.x += buf.ghostShiftX;
-            lastPos.x += buf.ghostShiftX;
-        }
         ghost->setPosition(pos);
         ghost->m_position = pos;
-        ghost->m_lastPosition = lastPos;
+        ghost->m_lastPosition = real->m_lastPosition;
 
         ghost->m_holdingButtons = real->m_holdingButtons;
         ghost->m_jumpBuffered = real->m_jumpBuffered;
@@ -814,201 +740,8 @@ namespace {
         }
     }
 
-    void forgetPresses() {
-        buf.chan[0].pressTick = -1;
-        buf.chan[1].pressTick = -1;
-    }
-
     int holdEstimate() {
         return tapHold.pick(st(12), 50);
-    }
-
-    // -------------------------------------------------------------------------
-    // Per-Level Memory (with v2.79 Last-Working Delay Support)
-    // -------------------------------------------------------------------------
-    constexpr float SLICE = 15.f;
-    constexpr int OUTCOME_TICKS = 90;
-
-    struct Spot {
-        uint32_t ok = 0;
-        uint32_t bad = 0;
-        uint32_t deaths = 0;
-        uint32_t delaySum = 0;
-        uint32_t last = 0;
-    };
-
-    std::unordered_map<int, Spot> memory;
-    std::string memoryKey;
-    bool memoryDirty = false;
-    int memoryUpdates = 0;
-
-    struct PendingOutcome {
-        bool active = false;
-        int slice = 0;
-        int tick = 0;
-        int delay = 0;
-        bool skipped = false;
-    } pending;
-
-    int sliceOf(PlayerObject* p) {
-        return static_cast<int>(std::floor(travelCoord(p) / SLICE));
-    }
-
-    Spot spotAround(int slice) {
-        Spot sum;
-        for (int s = slice - 1; s <= slice + 1; ++s) {
-            auto it = memory.find(s);
-            if (it == memory.end()) continue;
-            sum.ok += it->second.ok;
-            sum.bad += it->second.bad;
-            sum.deaths += it->second.deaths;
-            sum.delaySum += it->second.delaySum;
-        }
-        return sum;
-    }
-
-    std::filesystem::path memoryFile() {
-        return Mod::get()->getSaveDir() / "memory" / (memoryKey + "_v3.txt");
-    }
-
-    void saveMemory() {
-        if (!memoryDirty || memoryKey.empty()) return;
-        std::error_code ec;
-        std::filesystem::create_directories(memoryFile().parent_path(), ec);
-        std::ofstream out(memoryFile(), std::ios::trunc);
-        for (auto const& [slice, spot] : memory) {
-            out << slice << ' ' << spot.ok << ' ' << spot.bad << ' ' << spot.deaths << ' ' << spot.delaySum << ' ' << spot.last << '\n';
-        }
-        memoryDirty = false;
-    }
-
-    void loadMemory(GJGameLevel* level) {
-        memory.clear();
-        memoryDirty = false;
-        memoryUpdates = 0;
-        pending.active = false;
-        memoryKey.clear();
-        if (!level) return;
-
-        int id = level->m_levelID.value();
-        if (id > 0) {
-            memoryKey = fmt::format("level_{}", id);
-        } else {
-            std::string name = level->m_levelName;
-            for (auto& c : name) {
-                if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
-            }
-            memoryKey = "local_" + name;
-        }
-
-        std::ifstream in(memoryFile());
-        std::string line;
-        while (std::getline(in, line)) {
-            std::istringstream fields(line);
-            int slice;
-            Spot spot;
-            if (!(fields >> slice >> spot.ok >> spot.bad >> spot.deaths >> spot.delaySum)) {
-                continue;
-            }
-            fields >> spot.last;
-            memory[slice] = spot;
-        }
-
-        std::error_code ec;
-        auto written = std::filesystem::last_write_time(memoryFile(), ec);
-        if (!ec && std::filesystem::file_time_type::clock::now() - written > std::chrono::hours(12)) {
-            for (auto it = memory.begin(); it != memory.end();) {
-                auto& s = it->second;
-                uint32_t ok = s.ok * 3 / 4;
-                s.delaySum = s.ok > 0 ? static_cast<uint32_t>(static_cast<uint64_t>(s.delaySum) * ok / s.ok) : 0;
-                s.ok = ok;
-                if (ok == 0) {
-                    s.last = 0;
-                }
-                s.bad = s.bad * 3 / 4;
-                s.deaths = s.deaths * 3 / 4;
-                it = (s.ok | s.bad | s.deaths) == 0 ? memory.erase(it) : std::next(it);
-            }
-            memoryDirty = true;
-            saveMemory();
-        }
-    }
-
-    void memoryChanged() {
-        memoryDirty = true;
-        if (++memoryUpdates % 10 == 0) {
-            saveMemory();
-        }
-    }
-
-    void creditPending() {
-        if (!pending.active) return;
-        pending.active = false;
-        if (pending.delay > 0) {
-            auto& spot = memory[pending.slice];
-            auto delay = static_cast<uint32_t>(std::lround(pending.delay / stepScale()));
-            ++spot.ok;
-            spot.delaySum += delay;
-            spot.last = delay;
-            if (spot.bad > 0) {
-                --spot.bad;
-            }
-            memoryChanged();
-        }
-    }
-
-    void memoryNote(PlayerObject* p, int delay) {
-        if (memoryKey.empty() || !p) return;
-        if (pending.active && tickCount - pending.tick >= st(30)) {
-            creditPending();
-        }
-        pending = { true, sliceOf(p), tickCount, delay, false };
-    }
-
-    void memoryTick() {
-        if (pending.active && tickCount - pending.tick >= st(OUTCOME_TICKS)) {
-            creditPending();
-        }
-    }
-
-    bool memorySaysSkip(int slice) {
-        auto spot = spotAround(slice);
-        return spot.bad >= 2 && spot.bad > spot.ok;
-    }
-
-    void memoryDeath() {
-        if (!pending.active) return;
-        pending.active = false;
-        auto& spot = memory[pending.slice];
-        ++spot.deaths;
-        if (pending.delay > 0) {
-            ++spot.bad;
-        }
-        if (pending.skipped) {
-            int worst = pending.slice;
-            for (int s = pending.slice - 1; s <= pending.slice + 1; ++s) {
-                auto it = memory.find(s);
-                if (it != memory.end() && it->second.bad > memory[worst].bad) {
-                    worst = s;
-                }
-            }
-            if (memory[worst].bad > 0) {
-                --memory[worst].bad;
-            }
-        }
-        memoryChanged();
-    }
-
-    int memoryDelay(int slice) {
-        for (int sl : { slice, slice - 1, slice + 1 }) {
-            auto it = memory.find(sl);
-            if (it != memory.end() && it->second.last > 0) {
-                return st(static_cast<int>(it->second.last));
-            }
-        }
-        auto spot = spotAround(slice);
-        if (spot.ok < 2) return 0;
-        return st(static_cast<int>(std::lround(static_cast<double>(spot.delaySum) / spot.ok)));
     }
 
     // -------------------------------------------------------------------------
@@ -1149,7 +882,6 @@ namespace {
         buf.ghostSwitched = false;
         buf.firstOrbTick = -1;
         buf.lastOrbTick = -1;
-        buf.laterOrbTouched = false;
         buf.orbUsedTick = -1;
         buf.currentDelay = delay;
         buf.g1IsRealP2 = (p1 == layer->m_player2);
@@ -1169,7 +901,6 @@ namespace {
         buf.held1 = buf.held2 = initialHeld;
         buf.auto1 = buf.auto2 = false;
         buf.autoHold1 = buf.autoHold2 = 0;
-        buf.autoAt1 = buf.autoAt2 = -1;
 
         float dt = buf.tickLength;
         if (!(dt > 0.001f && dt < 2.0f)) {
@@ -1197,29 +928,6 @@ namespace {
 
         for (; tick < total; ++tick) {
             buf.simTick = tick;
-
-            if (buf.autoAt1 >= 0 && tick >= buf.autoAt1) {
-                if (buf.ghost1->m_touchingRings->count() > 0) {
-                    if (buf.held1 && tick > delay && !buf.ghost1->m_isDashing) {
-                        buf.ghost1->releaseButton(PlayerButton::Jump);
-                    }
-                    buf.ghost1->pushButton(PlayerButton::Jump);
-                    buf.auto1 = true;
-                    buf.autoHold1 = 0;
-                }
-                buf.autoAt1 = -1;
-            }
-            if (second && buf.autoAt2 >= 0 && tick >= buf.autoAt2) {
-                if (buf.ghost2->m_touchingRings->count() > 0) {
-                    if (buf.held2 && tick > delay && !buf.ghost2->m_isDashing) {
-                        buf.ghost2->releaseButton(PlayerButton::Jump);
-                    }
-                    buf.ghost2->pushButton(PlayerButton::Jump);
-                    buf.auto2 = true;
-                    buf.autoHold2 = 0;
-                }
-                buf.autoAt2 = -1;
-            }
 
             if (tick == delay && !buf.skipPress) {
                 pressGhost(buf.ghost1, down);
@@ -1289,14 +997,14 @@ namespace {
                     if (spider1) {
                         if (++groundTicks1 >= st(SPIDER_LAND)) landed1 = true;
                     } else if (airTicks1 >= st(ball1 ? 2 : 6)) {
-                        if (++groundTicks1 > st(ball1 ? 8 : 2)) landed1 = true;
+                        if (++groundTicks1 > st(ball1 ? 6 : 2)) landed1 = true;
                     }
                 } else {
                     ++airTicks1;
                     groundTicks1 = 0;
                     landed1 = false;
                 }
-            } else if (survived >= st(48)) {
+            } else if (survived >= st(40)) {
                 landed1 = true;
             }
 
@@ -1306,14 +1014,14 @@ namespace {
                         if (spider2) {
                             if (++groundTicks2 >= st(SPIDER_LAND)) landed2 = true;
                         } else if (airTicks2 >= st(ball2 ? 2 : 6)) {
-                            if (++groundTicks2 > st(ball2 ? 8 : 2)) landed2 = true;
+                            if (++groundTicks2 > st(ball2 ? 6 : 2)) landed2 = true;
                         }
                     } else {
                         ++airTicks2;
                         groundTicks2 = 0;
                         landed2 = false;
                     }
-                } else if (survived >= st(48)) {
+                } else if (survived >= st(40)) {
                     landed2 = true;
                 }
             }
@@ -1338,7 +1046,7 @@ namespace {
         return safe ? horizon : survived;
     }
 
-    bool quickScore = false;
+    int currentBaseSurvival = 0;
 
     int simulateOrbs(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, bool down, int horizon, int releaseAfter, int stopAt, SimEnd* end, bool fastSubCheck = false) {
@@ -1355,34 +1063,16 @@ namespace {
         if (firstEnd != SimEnd::StopSearch) {
             *end = SimEnd::Ok;
         }
-        int best = std::max(first, second);
-        if (!quickScore && Buffer::orbTiming && best < stopAt && !clickOverTime()) {
-            for (int late : { 3, 6 }) {
-                if (clickOverTime()) break;
-                buf.orbClick = true;
-                buf.orbClickDelay = st(late);
-                SimEnd lateEnd;
-                int ret = simulate(layer, p1, p2, dual, initialHeld, delay, down, horizon, releaseAfter, stopAt, &lateEnd);
-                buf.orbClickDelay = 0;
-                buf.orbClick = Buffer::assumeOrbs;
-                best = std::max(best, ret);
-                if (best >= stopAt) {
-                    break;
-                }
-            }
-        }
-        return best;
+        return std::max(first, second);
     }
 
     int fullWaveHorizon(bool mini) {
-        int wh = Buffer::waveHorizon; // 80
-        return st(mini ? std::max(20, wh - 15) : wh);
+        return st(mini ? (Buffer::waveHorizon - 12) : Buffer::waveHorizon);
     }
 
     int alignOrb(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
-        int horizon, int releaseAfter, int learned, int maxDelay, int* landed) {
+        int horizon, int releaseAfter, int maxDelay, int* landed) {
         int window = std::min(st(Buffer::orbWindow), maxDelay);
-        int found = 0;
         SimEnd end;
         buf.orbClick = false;
         buf.orbAfterFirst = true;
@@ -1390,57 +1080,12 @@ namespace {
             ~Reset() {
                 buf.orbClick = Buffer::assumeOrbs;
                 buf.orbAfterFirst = false;
-                buf.orbClickDelay = 0;
-                buf.ghostShiftX = 0.f;
             }
         } reset;
 
-        auto tryAt = [&](int k, bool* used, bool allowLateChain) {
-            int best = -1;
-            *used = false;
-            for (int late : { 0, 4 }) {
-                buf.orbClickDelay = st(late);
-                int ret = simulate(layer, p1, p2, dual, initialHeld, k, true, horizon, releaseAfter, horizon, &end);
-                buf.orbClickDelay = 0;
-                if (late == 0) {
-                    *used = buf.orbUsedTick >= 0;
-                }
-                best = std::max(best, ret);
-                if (!allowLateChain || ret >= horizon || buf.orbUsedTick < 0 || !buf.laterOrbTouched || end == SimEnd::StopSearch || clickOverTime()) {
-                    break;
-                }
-            }
-            return best;
-        };
-
-        auto robustAt = [&](int k) {
-            if (!Buffer::robustSaves) return true;
-            float shift = std::max(0.3f, 0.5f * (311.58f / 240.f) * (std::abs(p1->m_playerSpeed) / 0.9f));
-            for (float off : { shift, -shift }) {
-                if (clickOverTime()) return true;
-                buf.ghostShiftX = off;
-                bool used;
-                int ret = tryAt(k, &used, false);
-                buf.ghostShiftX = 0.f;
-                if (ret < horizon || !used) {
-                    return false;
-                }
-            }
-            return true;
-        };
-
-        if (learned > 0 && learned <= maxDelay && !clickOverTime()) {
-            bool used;
-            int ret = tryAt(learned, &used, true);
-            if (used && ret >= horizon) {
-                *landed = ret;
-                return learned;
-            }
-        }
-
         buf.skipPress = true;
         buf.orbAfterFirst = false;
-        int probeLen = window + st(6);
+        int probeLen = window + st(4);
         simulate(layer, p1, p2, dual, initialHeld, 0, true, probeLen, -1, probeLen, &end);
         buf.skipPress = false;
         buf.orbAfterFirst = true;
@@ -1450,22 +1095,21 @@ namespace {
             return 0;
         }
 
-        bool nowUsed;
-        int now = tryAt(0, &nowUsed, true);
-        if (nowUsed && (now >= horizon || !Buffer::orbTiming)) {
+        int now = simulate(layer, p1, p2, dual, initialHeld, 0, true, horizon, releaseAfter, horizon, &end);
+        bool nowUsed = (buf.orbUsedTick >= 0);
+        if (nowUsed && now >= horizon) {
             return 0;
         }
 
         int from = nowUsed ? 1 : std::max(1, touch - 1);
-        int to = std::min(maxDelay, std::max(leave, touch + st(6)));
+        int to = std::min(maxDelay, std::max(leave, touch + st(5)));
         int safeStart = -1, safeEnd = -1;
-        int bestRet = -1, bestK = 0;
-        int bestAt = -1;
+        int bestRet = -1, bestK = 0, bestAt = -1;
 
         for (int k = from; k <= to; ++k) {
             if (clickOverTime()) break;
-            bool used;
-            int ret = tryAt(k, &used, true);
+            int ret = simulate(layer, p1, p2, dual, initialHeld, k, true, horizon, releaseAfter, horizon, &end);
+            bool used = (buf.orbUsedTick >= 0);
             if (end == SimEnd::StopSearch) break;
             if (!used) {
                 if (safeStart >= 0) break;
@@ -1485,23 +1129,15 @@ namespace {
         }
 
         if (safeStart >= 0) {
-            int mid = (safeStart + safeEnd) / 2;
-            found = mid;
-            if (!clickOverTime() && !robustAt(mid) && safeEnd > safeStart && !clickOverTime()) {
-                int alt = (mid + 1 <= safeEnd) ? (mid + 1) : (mid - 1);
-                if (robustAt(alt)) found = alt;
-            }
             *landed = horizon;
-        } else if (bestK > 0 && bestAt >= std::max(now, 0) + st(12)) {
-            found = bestK;
-            *landed = bestRet;
+            return (safeStart + safeEnd) / 2;
         }
-        return found;
+        if (bestK > 0 && bestAt >= std::max(now, 0) + st(12)) {
+            *landed = bestRet;
+            return bestK;
+        }
+        return 0;
     }
-
-    constexpr int WAVE_TURN_MARGINS[] = { 4, 10 };
-    constexpr int WAVE_MIN_TURN = 6;
-    constexpr int WAVE_ESCAPE = 16;
 
     int waveScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, bool down, int horizon, int target, SimEnd* end) {
@@ -1509,11 +1145,12 @@ namespace {
         if (ret >= target || *end == SimEnd::StopSearch || clickOverTime()) {
             return ret;
         }
-        for (int margin : WAVE_TURN_MARGINS) {
-            if (clickOverTime()) break;
-            int turnAt = ret - st(margin);
-            if (turnAt < st(WAVE_MIN_TURN)) break;
-            int length = std::min(horizon, turnAt + st(WAVE_ESCAPE));
+        if (delay > 0 && (ret <= currentBaseSurvival + st(4) || ret < st(14))) {
+            return ret;
+        }
+        int turnAt = ret - st(6);
+        if (turnAt >= st(6)) {
+            int length = std::min(horizon, turnAt + st(14));
             SimEnd turnEnd;
             int turned = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, down, length, turnAt, length, &turnEnd, true);
             if (turned >= length) {
@@ -1523,45 +1160,38 @@ namespace {
         return ret;
     }
 
-    constexpr int ROBOT_HOLDS[] = { 6, 14, 28, 45 };
-    int robotUsedHold = -1;
+    constexpr int ROBOT_HOLDS[] = { 8, 22, 40 };
 
     int robotScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, int horizon, int target, SimEnd* end) {
         int usual = robotHold.pick(st(20), 50);
         int best = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, horizon, usual, target, end);
-        robotUsedHold = usual;
-        if (best >= target || *end == SimEnd::StopSearch || quickScore || clickOverTime()) {
+        if (best >= target || *end == SimEnd::StopSearch || clickOverTime()) {
             return best;
         }
         for (int hold : ROBOT_HOLDS) {
             if (clickOverTime()) break;
-            if (std::abs(st(hold) - usual) < st(3)) continue;
+            if (std::abs(st(hold) - usual) < st(4)) continue;
             SimEnd e;
             int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, horizon, st(hold), target, &e, true);
-            if (ret > best) {
-                best = ret;
-                robotUsedHold = st(hold);
-            }
+            if (ret > best) best = ret;
             if (best >= target) break;
         }
         return best;
     }
 
-    constexpr int SPIDER_RETAP[] = { 4, 10 };
-    constexpr int SPIDER_MIN_RETAP = 4;
-
     int spiderScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, int horizon, int releaseAfter, int target, SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, horizon, releaseAfter, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch || quickScore || clickOverTime()) {
+        if (ret >= target || *end == SimEnd::StopSearch || clickOverTime()) {
             return ret;
         }
-        for (int margin : SPIDER_RETAP) {
-            if (clickOverTime()) break;
-            int at = ret - st(margin);
-            if (at < st(SPIDER_MIN_RETAP)) break;
-            int length = std::min(horizon, at + st(16));
+        if (delay > 0 && (ret <= currentBaseSurvival + st(4) || ret < st(12))) {
+            return ret;
+        }
+        int at = ret - st(6);
+        if (at >= st(4)) {
+            int length = std::min(horizon, at + st(14));
             buf.retapAt = at;
             SimEnd e;
             int retapped = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, length, releaseAfter, length, &e, true);
@@ -1573,58 +1203,18 @@ namespace {
         return ret;
     }
 
-    constexpr int SAME_CRASH_TRIES = 4;
-
-    bool sameCrash(int k, int ret, int base, int& streak) {
-        if (streak >= 0 && std::abs(k + ret - base) <= 1) {
-            ++streak;
-        } else {
-            streak = -1;
-        }
-        return streak >= SAME_CRASH_TRIES;
-    }
-
-    int searchSmallest(int horizon, int maxDelay, int base, int* landed,
-        std::function<int(int, int, SimEnd*)> const& score, double maxAllowedMs = -1.0, bool needFull = false) {
-        if (maxAllowedMs < 0.0) maxAllowedMs = buf.budgetMs;
-        int target = needFull ? horizon : std::min(horizon, base + st(12));
-        int streak = 0;
-        for (int k = 1; k <= maxDelay; ++k) {
-            if (clickMs() >= maxAllowedMs) return 0;
-            SimEnd end;
-            int ret = score(k, target, &end);
-            if (end == SimEnd::StopSearch) return 0;
-            if (ret >= target) {
-                *landed = ret;
-                return k;
-            }
-            if (sameCrash(k, ret, base, streak)) return 0;
-        }
-        return 0;
-    }
-
-    int searchTwoPass(int horizon, int maxDelay, int base, int* landed,
-        std::function<int(int, int, SimEnd*)> const& score, bool needFull = false) {
-        quickScore = true;
-        int k = searchSmallest(horizon, maxDelay, base, landed, score, clickMs() + searchBudget() * 0.55, needFull);
-        quickScore = false;
-        if (k > 0 || clickOverTime()) return k;
-        return searchSmallest(horizon, maxDelay, base, landed, score, buf.budgetMs, needFull);
-    }
-
-    constexpr int SHIP_RECOVER[] = { 8, 18 };
-
     int shipScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, bool down, int horizon, int target, SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, down, horizon, -1, target, end);
         if (ret >= target || *end == SimEnd::StopSearch || clickOverTime()) {
             return ret;
         }
-        for (int margin : SHIP_RECOVER) {
-            if (clickOverTime()) break;
-            int turnAt = ret - st(margin);
-            if (turnAt < st(WAVE_MIN_TURN)) break;
-            int length = std::min(horizon, turnAt + st(WAVE_ESCAPE));
+        if (delay > 0 && (ret <= currentBaseSurvival + st(4) || ret < st(14))) {
+            return ret;
+        }
+        int turnAt = ret - st(10);
+        if (turnAt >= st(6)) {
+            int length = std::min(horizon, turnAt + st(14));
             SimEnd turnEnd;
             int turned = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, down, length, turnAt, length, &turnEnd, true);
             if (turned >= length) {
@@ -1634,19 +1224,18 @@ namespace {
         return ret;
     }
 
-    constexpr int UFO_REFLAP[] = { 6, 14 };
-
     int ufoScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, int horizon, int releaseAfter, int target, SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, horizon, releaseAfter, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch || quickScore || clickOverTime()) {
+        if (ret >= target || *end == SimEnd::StopSearch || clickOverTime()) {
             return ret;
         }
-        for (int margin : UFO_REFLAP) {
-            if (clickOverTime()) break;
-            int at = ret - st(margin);
-            if (at < st(4)) break;
-            int length = std::min(horizon, at + st(20));
+        if (delay > 0 && (ret <= currentBaseSurvival + st(4) || ret < st(12))) {
+            return ret;
+        }
+        int at = ret - st(8);
+        if (at >= st(4)) {
+            int length = std::min(horizon, at + st(16));
             buf.retapAt = at;
             SimEnd e;
             int reflapped = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, length, releaseAfter, length, &e, true);
@@ -1658,56 +1247,53 @@ namespace {
         return ret;
     }
 
-    int searchWave(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
-        bool down, int horizon, int maxDelay, int base, int* landed) {
-        int target = std::min(horizon, base + st(12));
-        for (int k = 1; k <= maxDelay; ++k) {
-            if (clickOverTime()) return 0;
-            SimEnd end;
-            int ret = waveScore(layer, p1, p2, dual, initialHeld, k, down, horizon, target, &end);
-            if (end == SimEnd::StopSearch) return 0;
-            if (ret >= target) {
-                *landed = ret;
-                if (Buffer::waveMargin && k + 2 <= maxDelay && !clickOverTime()) {
-                    SimEnd e1, e2;
-                    if (waveScore(layer, p1, p2, dual, initialHeld, k + 1, down, horizon, target, &e1) >= target &&
-                        !clickOverTime() &&
-                        waveScore(layer, p1, p2, dual, initialHeld, k + 2, down, horizon, target, &e2) >= target) {
-                        return k + 1;
-                    }
-                }
-                return k;
-            }
+    constexpr int SAME_CRASH_TRIES = 3;
+
+    bool sameCrash(int k, int ret, int base, int& streak) {
+        if (streak >= 0 && std::abs(k + ret - base) <= 1) {
+            ++streak;
+        } else {
+            streak = -1;
         }
-        return 0;
+        return streak >= SAME_CRASH_TRIES;
     }
 
-    int searchDelay(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
-        bool down, int horizon, int maxDelay, int releaseAfter, int base, int* landed, bool needFull = false) {
+    // Unified fast stride-2 + 1-tick refinement search
+    int searchFast(int horizon, int maxDelay, int base, bool needFull,
+        std::function<int(int, int, SimEnd*)> const& score) {
         int target = needFull ? horizon : std::min(horizon, base + st(12));
-        int sameStreak = 0;
-        for (int k = 1; k <= maxDelay; ++k) {
-            if (clickOverTime()) break;
+        int streak = 0;
+        int prevTested = 0;
+
+        for (int k = 1; k <= maxDelay;) {
+            if (clickOverTime()) return 0;
             SimEnd end;
-            int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, k, down, horizon, releaseAfter, target, &end);
-            if (end == SimEnd::StopSearch) break;
-            if (ret < target && sameCrash(k, ret, base, sameStreak)) break;
+            int ret = score(k, target, &end);
+            if (end == SimEnd::StopSearch) return 0;
             if (ret >= target) {
-                SimEnd full;
-                if (ret < horizon && !clickOverTime() &&
-                    simulateOrbs(layer, p1, p2, dual, initialHeld, k, down, horizon, releaseAfter, horizon, &full) < horizon) {
-                    for (int j = k + 1; j <= maxDelay && !clickOverTime(); ++j) {
-                        SimEnd e;
-                        int r = simulateOrbs(layer, p1, p2, dual, initialHeld, j, down, horizon, releaseAfter, horizon, &e);
-                        if (e == SimEnd::StopSearch) break;
-                        if (r >= horizon) {
-                            *landed = r;
-                            return j;
-                        }
+                int bestK = k;
+                if (k - prevTested > 1 && !clickOverTime()) {
+                    SimEnd prevEnd;
+                    if (score(k - 1, target, &prevEnd) >= target) {
+                        bestK = k - 1;
                     }
                 }
-                *landed = ret;
-                return k;
+                // 1-tick safety margin check if time permits
+                if (bestK + 1 <= maxDelay && !clickOverTime()) {
+                    SimEnd nextEnd;
+                    if (score(bestK + 1, target, &nextEnd) >= target) {
+                        return bestK + 1;
+                    }
+                }
+                return bestK;
+            }
+            if (sameCrash(k, ret, base, streak)) return 0;
+            prevTested = k;
+            int step = (k >= 3 && maxDelay >= 8) ? 2 : 1;
+            if (k < maxDelay && k + step > maxDelay) {
+                k = maxDelay;
+            } else {
+                k += step;
             }
         }
         return 0;
@@ -1717,8 +1303,7 @@ namespace {
     // Input Interception & Queue Delivery (Full 1P, Dual, and 2-Player Support)
     // -------------------------------------------------------------------------
     bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
-        ClickTimer timer;
-        clickBudget();
+        clickStart = std::chrono::steady_clock::now();
         auto* layer = GameManager::get()->m_playLayer;
         if (!layer || layer->m_isPlatformer) {
             return false;
@@ -1813,8 +1398,7 @@ namespace {
         if (!ch.queue.empty()) {
             int after = ch.queue.back().ticksLeft;
             int minNext = (ch.queue.back().down != down) ? (after + 1) : after;
-            int targetTick = (Buffer::lowLatencyQueue && down) ? minNext : std::max(ch.shift - early, minNext);
-            ch.queue.push_back({ targetTick, down });
+            ch.queue.push_back({ std::max(ch.shift - early, minNext), down });
             return true;
         }
 
@@ -1839,12 +1423,13 @@ namespace {
         }
 
         bool anyFlyer = isFlying(p1) || (p2 && isFlying(p2));
-        int horizon = st(anyFlyer ? 48 : Buffer::groundHorizon);
+        int horizon = st(anyFlyer ? 44 : Buffer::groundHorizon);
         if (anyWave) {
             horizon = fullWaveHorizon(mini);
         }
 
-        int rawMax = anyWave ? buf.ticksWave.load() : (anyShip ? Buffer::shipMaxDelay : buf.ticksAll.load());
+        int rawMax = anyWave ? buf.ticksWave.load(std::memory_order_relaxed)
+                             : (anyShip ? Buffer::shipMaxDelay : buf.ticksAll.load(std::memory_order_relaxed));
         int maxDelay = st(rawMax);
         if (maxDelay <= 0) {
             ch.appliedInput = down;
@@ -1858,7 +1443,6 @@ namespace {
         }
 
         bool grounded = p1->m_isOnGround && (!p2 || p2->m_isOnGround);
-        int slice = sliceOf(p1);
         bool initialHeld = ch.appliedInput;
 
         SimEnd end;
@@ -1870,20 +1454,20 @@ namespace {
         bool shipInput = anyShip && !anyWave;
         bool groundPress = down && !anyFlyer && !anyRobot && !anySpider && !anyWave;
 
-        // For mid-air ground-based modes (Cube/Ball/Robot/Spider in the air), try orb alignment first
-        if (down && !grounded && !anyWave && !anyShip && !ufoPress && Buffer::orbAlign && !memorySaysSkip(slice)) {
+        // Mid-air orb alignment for non-flying modes
+        if (down && !grounded && !anyWave && !anyShip && !ufoPress && Buffer::orbAlign) {
             int orbLanded = 0;
-            int k = alignOrb(layer, p1, p2, simDual, initialHeld, horizon, releaseAfter, memoryDelay(slice), maxDelay, &orbLanded);
+            int k = alignOrb(layer, p1, p2, simDual, initialHeld, horizon, releaseAfter, maxDelay, &orbLanded);
             if (k > 0) {
-                memoryNote(p1, k);
                 ch.shift = k;
                 ch.queue.push_back({ std::max(0, k - early), down });
-                notifyExternalSave(k, "ORB", down);
+                notifyExternalSave(k, true, down);
                 return true;
             }
         }
 
         // Run base (delay = 0)
+        currentBaseSurvival = 0;
         buf.captureBase = true;
         buf.baseTouchedDown = false;
         int base = cubeStyleWave ? waveScore(layer, p1, p2, simDual, initialHeld, 0, down, horizon, horizon, &end)
@@ -1893,42 +1477,28 @@ namespace {
                  : shipInput     ? shipScore(layer, p1, p2, simDual, initialHeld, 0, down, horizon, horizon, &end)
                                  : simulateOrbs(layer, p1, p2, simDual, initialHeld, 0, down, horizon, releaseAfter, horizon, &end);
         buf.captureBase = false;
+        currentBaseSurvival = base;
 
-        // If pressing right now is already safe, pass through immediately (0 extra simulations!)
         if (base >= horizon || clickOverTime()) {
-            memoryNote(p1, 0);
             ch.appliedInput = down;
             return false;
         }
 
-        // If base died and we haven't checked orb alignment yet (e.g. UFO/Swing or ground-overlapping ledge orb), check now
-        if (down && (grounded || ufoPress) && !anyWave && !anyShip && Buffer::orbAlign && !memorySaysSkip(slice) && !clickOverTime()) {
+        if (down && (grounded || ufoPress) && !anyWave && !anyShip && Buffer::orbAlign && !clickOverTime()) {
             int orbLanded = 0;
-            int k = alignOrb(layer, p1, p2, simDual, initialHeld, horizon, releaseAfter, memoryDelay(slice), maxDelay, &orbLanded);
+            int k = alignOrb(layer, p1, p2, simDual, initialHeld, horizon, releaseAfter, maxDelay, &orbLanded);
             if (k > 0) {
-                memoryNote(p1, k);
                 ch.shift = k;
                 ch.queue.push_back({ std::max(0, k - early), down });
-                notifyExternalSave(k, "ORB", down);
+                notifyExternalSave(k, true, down);
                 return true;
             }
         }
 
         if (groundPress && Buffer::lateCrash > 0 && base >= st(Buffer::lateCrash) && buf.baseTouchedDown) {
-            memoryNote(p1, 0);
             ch.appliedInput = down;
             return false;
         }
-
-        if (memorySaysSkip(slice)) {
-            memoryNote(p1, 0);
-            pending.skipped = true;
-            ch.appliedInput = down;
-            return false;
-        }
-
-        int landed = 0;
-        int saved = 0;
 
         auto scoreAt = [&](int k, int target, SimEnd* e) {
             return cubeStyleWave ? waveScore(layer, p1, p2, simDual, initialHeld, k, down, horizon, target, e)
@@ -1939,70 +1509,17 @@ namespace {
                                  : simulateOrbs(layer, p1, p2, simDual, initialHeld, k, down, horizon, releaseAfter, target, e);
         };
 
-        int needed = (groundPress || robotPress || ufoPress) ? horizon : std::min(horizon, base + st(12));
-        int learned = memoryDelay(slice);
-        if (learned > 0 && learned <= maxDelay && !clickOverTime()) {
-            SimEnd e;
-            int ret = scoreAt(learned, needed, &e);
-            if (ret >= needed) {
-                saved = learned;
-                landed = ret;
-            }
-        }
-
-        if (saved <= 0 && !clickOverTime()) {
-            saved = cubeStyleWave ? searchWave(layer, p1, p2, simDual, initialHeld, down, horizon, maxDelay, base, &landed)
-                  : robotPress    ? searchTwoPass(horizon, maxDelay, base, &landed, [&](int k, int target, SimEnd* e) {
-                        return robotScore(layer, p1, p2, simDual, initialHeld, k, horizon, target, e);
-                    }, true)
-                  : spiderPress   ? searchTwoPass(horizon, maxDelay, base, &landed, [&](int k, int target, SimEnd* e) {
-                        return spiderScore(layer, p1, p2, simDual, initialHeld, k, horizon, releaseAfter, target, e);
-                    })
-                  : shipInput     ? searchSmallest(horizon, maxDelay, base, &landed, [&](int k, int target, SimEnd* e) {
-                        return shipScore(layer, p1, p2, simDual, initialHeld, k, down, horizon, target, e);
-                    })
-                  : ufoPress      ? searchTwoPass(horizon, maxDelay, base, &landed, [&](int k, int target, SimEnd* e) {
-                        return ufoScore(layer, p1, p2, simDual, initialHeld, k, horizon, releaseAfter, target, e);
-                    }, true)
-                                  : searchDelay(layer, p1, p2, simDual, initialHeld, down, horizon, maxDelay, releaseAfter, base, &landed, groundPress);
-        }
+        bool needFull = (groundPress || robotPress || ufoPress);
+        int saved = searchFast(horizon, maxDelay, base, needFull, scoreAt);
 
         if (saved <= 0) {
-            memoryNote(p1, 0);
             ch.appliedInput = down;
             return false;
         }
 
-        if (Buffer::robustSaves && !clickOverTime()) {
-            float shift = std::max(0.3f, 0.5f * (311.58f / 240.f) * (std::abs(p1->m_playerSpeed) / 0.9f));
-            auto robust = [&](int k) {
-                for (float off : { shift, -shift }) {
-                    if (clickOverTime()) return true;
-                    buf.ghostShiftX = off;
-                    SimEnd e;
-                    int ret = scoreAt(k, needed, &e);
-                    buf.ghostShiftX = 0.f;
-                    if (ret < needed) return false;
-                }
-                return true;
-            };
-            if (!robust(saved)) {
-                for (int k = saved + 1; k <= std::min(maxDelay, saved + st(3)) && !clickOverTime(); ++k) {
-                    SimEnd e;
-                    int ret = scoreAt(k, needed, &e);
-                    if (ret >= needed && robust(k)) {
-                        saved = k;
-                        landed = ret;
-                        break;
-                    }
-                }
-            }
-        }
-
-        memoryNote(p1, saved);
         ch.shift = saved;
         ch.queue.push_back({ std::max(0, saved - early), down });
-        notifyExternalSave(saved, "SAVED", down);
+        notifyExternalSave(saved, false, down);
         return true;
     }
 
@@ -2040,7 +1557,7 @@ namespace {
 }
 
 // -----------------------------------------------------------------------------
-// Mod Initialization & Hooks (Zero In-Game UI Signs)
+// Mod Initialization & Hooks (Zero In-Game UI Signs, Zero Disk Saving)
 // -----------------------------------------------------------------------------
 $on_mod(Loaded) {
     buf.snapshots.reserve(32);
@@ -2049,8 +1566,7 @@ $on_mod(Loaded) {
     buf.simDisabled.reserve(32);
     buf.harmless.reserve(16);
 
-    int savedIdx = std::clamp(static_cast<int>(Mod::get()->getSavedValue<int64_t>("stage-idx-locked", 1)), 0, STAGE_COUNT - 1);
-    setStageByIndex(savedIdx, false);
+    setStageByIndex(1); // Starts on 4 Ticks
     spawnExternalWindow();
 }
 
@@ -2073,7 +1589,6 @@ class $modify(BufPlayLayer, PlayLayer) {
         }
         buf.chan[0].fullReset();
         buf.chan[1].fullReset();
-        memoryDeath();
     }
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
@@ -2081,7 +1596,6 @@ class $modify(BufPlayLayer, PlayLayer) {
             return false;
         }
         dropGhosts();
-        loadMemory(level);
         buf.ghost1 = makeGhost(this);
         buf.ghost2 = makeGhost(this);
         buf.ghostLayerBase = buf.ghostLayer->getChildrenCount();
@@ -2091,14 +1605,11 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     void onQuit() {
-        saveMemory();
-        memoryKey.clear();
         dropGhosts();
         PlayLayer::onQuit();
     }
 
     void resetLevel() {
-        pending.active = false;
         buf.chan[0].fullReset();
         buf.chan[1].fullReset();
         PlayLayer::resetLevel();
@@ -2208,7 +1719,6 @@ class $modify(BufPlayerObject, PlayerObject) {
 
         if (isP1) {
             ++tickCount;
-            memoryTick();
             deliverPending(layer);
         }
 
@@ -2301,11 +1811,6 @@ class $modify(BufKeyboard, CCKeyboardDispatcher) {
         if (isKeyDown && !isKeyRepeat) {
             if (key == KEY_F6 || key == KEY_Six) {
                 cycleStage();
-            } else if (key == KEY_F11 && GameManager::get()->m_playLayer) {
-                memory.clear();
-                pending.active = false;
-                memoryDirty = true;
-                saveMemory();
             }
         }
         return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat, timestamp);
@@ -2380,13 +1885,12 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                 continue;
             }
 
-            // Scale-aware fast spatial culling: only cull unscaled standard-sized objects >75u away
             if (object->m_scaleX == 1.f && object->m_scaleY == 1.f &&
                 object->m_width <= 45.f && object->m_height <= 45.f) {
-                if (std::abs(object->m_positionX - gx) > 75.0) {
+                if (std::abs(object->m_positionX - gx) > 70.0) {
                     continue;
                 }
-                if (!isSpider && std::abs(object->m_positionY - gy) > 75.0) {
+                if (!isSpider && std::abs(object->m_positionY - gy) > 70.0) {
                     continue;
                 }
             }
@@ -2435,7 +1939,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                         buf.harmless.push_back(object);
                         continue;
                     }
-                    if (Buffer::portalPredict && Buffer::fullState && (MODE_TYPES & bit)) {
+                    if (Buffer::portalPredict && (MODE_TYPES & bit)) {
                         setGhostMode(player, object->m_objectType);
                         buf.harmless.push_back(object);
                         continue;
@@ -2478,9 +1982,6 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                 buf.firstOrbTick = buf.simTick;
             }
             buf.lastOrbTick = buf.simTick;
-            if (buf.orbUsedTick >= 0 && !isOrbUsedByGhost(ring, player)) {
-                buf.laterOrbTouched = true;
-            }
         }
         GJBaseGameLayer::playerTouchedRing(player, ring);
 
@@ -2490,13 +1991,8 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             bool& held = first ? buf.held1 : buf.held2;
             bool& autoClick = first ? buf.auto1 : buf.auto2;
             int& autoHold = first ? buf.autoHold1 : buf.autoHold2;
-            int& autoAt = first ? buf.autoAt1 : buf.autoAt2;
 
-            if (buf.orbClickDelay > 0) {
-                if (autoAt == -1) {
-                    autoAt = buf.simTick + buf.orbClickDelay;
-                }
-            } else if (!autoClick) {
+            if (!autoClick) {
                 if (held && buf.simTick > buf.currentDelay && !player->m_isDashing) {
                     player->releaseButton(PlayerButton::Jump);
                 }
