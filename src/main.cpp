@@ -1,6 +1,7 @@
-// Click Before Frames — External Window Edition (Pure Physics, Zero Saving, Sub-Millisecond Build)
+// Click Before Frames — Unified External Window Master Edition
 // Zero in-game visual/audio footprint. Zero disk I/O. Separate Win32 control window.
-// Selectable ticks: 2, 4, 8, 16.
+// Full 2.2 Moving Objects (Proactive Kinematic + Polar + Eased + Trigger/Spawn/Lock-to-Player),
+// All Portals (Mode, Size, Speed, Dual, Solo, Teleport+Gravity), Multi-Timing Orbs, All 8 Modes.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
@@ -15,14 +16,17 @@
 
 #include <Windows.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace geode::prelude;
@@ -32,9 +36,10 @@ namespace {
     constexpr float TICK = 0.25f;
     constexpr int SPIDER_LAND = 10;
     constexpr int SPAM_STREAK = 3;
+    constexpr int MAX_RESUMES = 4;
 
-    constexpr int ALLOWED_TICKS[4] = { 2, 4, 8, 16 };
-    constexpr int STAGE_COUNT = 4;
+    constexpr int ALLOWED_TICKS[5] = { 2, 4, 8, 16, 32 };
+    constexpr int STAGE_COUNT = 5;
 
     constexpr uint64_t typeBit(GameObjectType type) {
         return 1ull << static_cast<int>(type);
@@ -88,17 +93,27 @@ namespace {
     }
 
     struct QueuedInput {
-        int ticksLeft;
-        bool down;
+        int ticksLeft = 0;
+        bool down = false;
+        bool resume = false;
+        int from = 1;
+        int elapsed = 0;
+        int resumes = 0;
     };
 
     struct ObjSnapshot {
-        GameObject* object;
-        bool isActivated;
-        EffectGameObject* effect;
-        bool activated;
-        bool byP1;
-        bool byP2;
+        GameObject* object = nullptr;
+        bool isActivated = false;
+        EffectGameObject* effect = nullptr;
+        bool activated = false;
+        bool byP1 = false;
+        bool byP2 = false;
+        bool animated = false;
+    };
+
+    struct NodeMark {
+        CCNode* node = nullptr;
+        unsigned count = 0;
     };
 
     enum class InputKind { Tap, Wave, Robot, Other };
@@ -136,13 +151,18 @@ namespace {
         PlayerObject* ghost2 = nullptr;
         CCLayer* ghostLayer = nullptr;
         unsigned ghostLayerBase = 0;
+        PlayLayer* owner = nullptr;
 
         bool simulating = false;
         bool injecting = false;
         bool ghostDied = false;
         bool ghostHitPortal = false;
         bool ghostSwitched = false;
-        bool ghostNeedsModeRestore = false;
+        bool lastRunSwitched = false;
+        bool ghostSolo = false;
+        bool simSecond = false;
+        bool ghostNeedsModeRestore1 = false;
+        bool ghostNeedsModeRestore2 = false;
         bool haveStartRects = false;
         bool g1IsRealP2 = false;
 
@@ -152,39 +172,49 @@ namespace {
         std::atomic<int> totalSaves { 0 };
 
         ChannelState chan[2];
-
         float tickLength = TICK;
 
-        // Sub-millisecond tuned constants for butter-smooth frame pacing
-        static constexpr double budgetMs = 1.0; // Never spend more than 1.0 ms on a click
-        static constexpr int groundHorizon = 95;
-        static constexpr int waveHorizon = 56;
+        // Tuned engine constants
+        static constexpr double budgetMs = 2.0; // Paired with noHitch multi-tick continuation
+        static constexpr int groundHorizon = 120;
+        static constexpr int waveHorizon = 64;
         static constexpr bool assumeOrbs = true;
         static constexpr bool tryBothOrbs = true;
-        static constexpr int spamGap = 24;
+        static constexpr bool orbTiming = true;
         static constexpr bool orbAlign = true;
-        static constexpr int orbWindow = 16;
+        static constexpr int orbWindow = 20;
+        static constexpr int spamGap = 18;
+        static constexpr int shipSpamGap = 6;
+        static constexpr int lateCrash = 90;
         static constexpr bool portalPredict = true;
-        static constexpr bool spiderSmart = true;
-        static constexpr bool shipBuffer = true;
-        static constexpr int shipMaxDelay = 4;
-        static constexpr int lateCrash = 80;
+        static constexpr bool predictMovers = true;
+        static constexpr bool predictTriggers = true;
+        static constexpr bool robustSaves = true;
+        static constexpr bool waveMargin = true;
+        static constexpr bool nextClick = true;
+        static constexpr bool noHitch = true;
         static constexpr bool ignoreTouching = true;
         static constexpr bool cbfSync = true;
+        static constexpr bool spiderSmart = true;
         static constexpr bool ufoSmart = true;
-        static constexpr int shipSpamGap = 12;
         static constexpr bool ballSmart = true;
         static constexpr bool swingSmart = true;
+        static constexpr bool robotSmart = true;
 
-        // Simulation transient state
+        // Transient simulation state
         bool held1 = false, held2 = false;
         bool auto1 = false, auto2 = false;
+        int autoAt1 = -1, autoAt2 = -1;
         int autoHold1 = 0, autoHold2 = 0;
+        int orbClickDelay = 0;
         bool orbClick = true;
         bool touchedOrb = false;
+        bool orbAfterFirst = false;
+        bool laterOrbTouched = false;
         bool skipPress = false;
         bool haveRealRect = false;
         CCRect realRect1, realRect2;
+        float ghostShiftX = 0.f;
         float firstStep = 1.f;
         bool inRealUpdate = false;
         float tickStartCoord[2] = { 0.f, 0.f };
@@ -194,7 +224,6 @@ namespace {
         int currentDelay = 0;
         int firstOrbTick = -1;
         int lastOrbTick = -1;
-        bool orbAfterFirst = false;
         int orbUsedTick = -1;
         bool captureBase = false;
         bool baseTouchedDown = false;
@@ -203,7 +232,9 @@ namespace {
         std::vector<std::pair<GameObject*, uint8_t>> simUsed;
         std::vector<std::pair<GameObject*, uint8_t>> orbsUsed;
         std::vector<GameObject*> simDisabled;
+        std::vector<GameObject*> simEnabled;
         std::vector<GameObject*> harmless;
+        std::vector<NodeMark> levelMarks;
     } buf;
 
     template <typename T>
@@ -212,10 +243,10 @@ namespace {
     }
 
     // -------------------------------------------------------------------------
-    // External Win32 GUI Window (100% Lock-Free Main-Thread Messaging)
+    // External Win32 GUI Window (Zero In-Game Footprint)
     // -------------------------------------------------------------------------
     std::atomic<HWND> g_extHwnd { nullptr };
-    HWND g_radioBtns[4] = {};
+    HWND g_radioBtns[STAGE_COUNT] = {};
     HWND g_statusLabel = nullptr;
     HWND g_saveLabel = nullptr;
 
@@ -224,11 +255,17 @@ namespace {
 
     void setStageByIndex(int idx);
 
-    inline void notifyExternalSave(int delayTicks, bool isOrb, bool down) {
+    enum SaveTag : int { TagNormal = 0, TagOrb = 1, TagRobust = 2, TagSpam = 3 };
+
+    inline void notifyExternalSave(int delayTicks, SaveTag tag, bool down) {
         int total = buf.totalSaves.fetch_add(1, std::memory_order_relaxed) + 1;
         if (HWND hwnd = g_extHwnd.load(std::memory_order_relaxed)) {
             WPARAM wp = static_cast<WPARAM>(total);
-            LPARAM lp = static_cast<LPARAM>((delayTicks & 0xFFFF) | (isOrb ? (1 << 16) : 0) | (down ? (1 << 17) : 0));
+            LPARAM lp = static_cast<LPARAM>(
+                (delayTicks & 0xFFFF) |
+                ((static_cast<int>(tag) & 0xF) << 16) |
+                (down ? (1 << 20) : 0)
+            );
             PostMessageA(hwnd, WM_APP_SYNC_SAVE, wp, lp);
         }
     }
@@ -244,50 +281,51 @@ namespace {
                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
 
                 HWND title = CreateWindowExA(0, "STATIC", "Select Buffer Window (Ticks):",
-                    WS_CHILD | WS_VISIBLE, 16, 14, 245, 22, hwnd, nullptr, nullptr, nullptr);
+                    WS_CHILD | WS_VISIBLE, 16, 14, 255, 22, hwnd, nullptr, nullptr, nullptr);
                 SendMessageA(title, WM_SETFONT, (WPARAM)hFontTitle, TRUE);
 
-                char const* labels[4] = {
+                char const* labels[STAGE_COUNT] = {
                     "2 Ticks  (0.5 Frames @ 60Hz)",
                     "4 Ticks  (1.0 Frame  @ 60Hz)",
                     "8 Ticks  (2.0 Frames @ 60Hz)",
-                    "16 Ticks (4.0 Frames @ 60Hz)"
+                    "16 Ticks (4.0 Frames @ 60Hz)",
+                    "32 Ticks (8.0 Frames @ 60Hz)"
                 };
 
-                int currentIdx = std::clamp(buf.stageIndex.load(), 0, 3);
-                for (int i = 0; i < 4; ++i) {
+                int currentIdx = std::clamp(buf.stageIndex.load(), 0, STAGE_COUNT - 1);
+                for (int i = 0; i < STAGE_COUNT; ++i) {
                     DWORD style = WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | (i == 0 ? WS_GROUP : 0);
                     g_radioBtns[i] = CreateWindowExA(0, "BUTTON", labels[i], style,
-                        20, 44 + i * 28, 235, 24, hwnd, (HMENU)(intptr_t)(100 + i), nullptr, nullptr);
+                        20, 44 + i * 28, 245, 24, hwnd, (HMENU)(intptr_t)(100 + i), nullptr, nullptr);
                     SendMessageA(g_radioBtns[i], WM_SETFONT, (WPARAM)hFont, TRUE);
                     SendMessageA(g_radioBtns[i], BM_SETCHECK, (i == currentIdx) ? BST_CHECKED : BST_UNCHECKED, 0);
                 }
 
-                g_statusLabel = CreateWindowExA(0, "STATIC", "Active: 4 Ticks (F6 to cycle)",
-                    WS_CHILD | WS_VISIBLE, 16, 162, 250, 20, hwnd, nullptr, nullptr, nullptr);
+                g_statusLabel = CreateWindowExA(0, "STATIC", "Active: 4 Ticks (F6 / 6 to cycle)",
+                    WS_CHILD | WS_VISIBLE, 16, 190, 260, 20, hwnd, nullptr, nullptr, nullptr);
                 SendMessageA(g_statusLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
 
                 g_saveLabel = CreateWindowExA(0, "STATIC", "Saves: 0 | Ready",
-                    WS_CHILD | WS_VISIBLE, 16, 186, 250, 20, hwnd, nullptr, nullptr, nullptr);
+                    WS_CHILD | WS_VISIBLE, 16, 214, 260, 20, hwnd, nullptr, nullptr, nullptr);
                 SendMessageA(g_saveLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
                 return 0;
             }
             case WM_COMMAND: {
                 int id = LOWORD(wParam);
-                if (id >= 100 && id < 104 && HIWORD(wParam) == BN_CLICKED) {
+                if (id >= 100 && id < 100 + STAGE_COUNT && HIWORD(wParam) == BN_CLICKED) {
                     setStageByIndex(id - 100);
                 }
                 return 0;
             }
             case WM_APP_SYNC_STAGE: {
-                int idx = std::clamp(static_cast<int>(wParam), 0, 3);
-                for (int i = 0; i < 4; ++i) {
+                int idx = std::clamp(static_cast<int>(wParam), 0, STAGE_COUNT - 1);
+                for (int i = 0; i < STAGE_COUNT; ++i) {
                     if (g_radioBtns[i]) {
                         SendMessageA(g_radioBtns[i], BM_SETCHECK, (i == idx) ? BST_CHECKED : BST_UNCHECKED, 0);
                     }
                 }
                 if (g_statusLabel) {
-                    auto txt = fmt::format("Active: {} Ticks (F6 to cycle)", ALLOWED_TICKS[idx]);
+                    auto txt = fmt::format("Active: {} Ticks (F6 / 6 to cycle)", ALLOWED_TICKS[idx]);
                     SetWindowTextA(g_statusLabel, txt.c_str());
                 }
                 return 0;
@@ -296,10 +334,11 @@ namespace {
                 if (g_saveLabel) {
                     int total = static_cast<int>(wParam);
                     int delayTicks = static_cast<int>(lParam & 0xFFFF);
-                    bool isOrb = (lParam & (1 << 16)) != 0;
-                    bool down = (lParam & (1 << 17)) != 0;
-                    auto txt = fmt::format("Saves: {} | Last: {} {} +{}t ({:g}f)",
-                        total, isOrb ? "ORB" : "SAVED", down ? "press" : "rel", delayTicks, delayTicks * TICK);
+                    int tag = static_cast<int>((lParam >> 16) & 0xF);
+                    bool down = (lParam & (1 << 20)) != 0;
+                    char const* tagStr = tag == TagOrb ? "ORB" : tag == TagRobust ? "ROBUST" : tag == TagSpam ? "SPAM" : "SAVED";
+                    auto txt = fmt::format("Saves: {} | {} {} +{}t ({:g}f)",
+                        total, tagStr, down ? "press" : "rel", delayTicks, delayTicks * TICK);
                     SetWindowTextA(g_saveLabel, txt.c_str());
                 }
                 return 0;
@@ -321,11 +360,11 @@ namespace {
             wc.hInstance = hInst;
             wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
             wc.hbrBackground = (HBRUSH)(COLOR_WINDOW);
-            wc.lpszClassName = "CBFExternalControlWnd";
+            wc.lpszClassName = "CBFExternalMasterWnd";
             RegisterClassExA(&wc);
 
             DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-            RECT rc = { 0, 0, 280, 220 };
+            RECT rc = { 0, 0, 290, 248 };
             AdjustWindowRect(&rc, style, FALSE);
 
             HWND hwnd = CreateWindowExA(
@@ -354,7 +393,7 @@ namespace {
         buf.stageIndex.store(idx, std::memory_order_relaxed);
         int ticks = ALLOWED_TICKS[idx];
         buf.ticksAll.store(ticks, std::memory_order_relaxed);
-        buf.ticksWave.store(ticks, std::memory_order_relaxed);
+        buf.ticksWave.store(ticks >= 24 ? 16 : ticks, std::memory_order_relaxed);
         if (HWND hwnd = g_extHwnd.load(std::memory_order_relaxed)) {
             PostMessageA(hwnd, WM_APP_SYNC_STAGE, idx, 0);
         }
@@ -366,16 +405,34 @@ namespace {
     }
 
     // -------------------------------------------------------------------------
-    // Core Physics, Timing & Scaling Helpers
+    // Timing, Rate Scaling & Basic Ghost Helpers
     // -------------------------------------------------------------------------
     std::chrono::steady_clock::time_point clickStart;
+    bool clickTimed = false;
+    int tickCount = 0;
+
+    struct ClickTimer {
+        ClickTimer() {
+            clickStart = std::chrono::steady_clock::now();
+            clickTimed = true;
+        }
+        ~ClickTimer() {
+            clickTimed = false;
+        }
+    };
 
     inline double clickMs() {
-        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count();
+        return clickTimed
+            ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count()
+            : 0.0;
     }
 
     inline bool clickOverTime() {
-        return clickMs() >= Buffer::budgetMs;
+        return clickMs() >= Buffer::budgetMs * 1.25;
+    }
+
+    inline double searchBudget() {
+        return clickTimed ? std::max(Buffer::budgetMs - clickMs(), Buffer::budgetMs * 0.45) : Buffer::budgetMs;
     }
 
     float stepScale() {
@@ -402,8 +459,732 @@ namespace {
         return p->m_isSideways ? pos.y : pos.x;
     }
 
-    int tickCount = 0;
+    bool gameHolds(PlayerObject* player) {
+        if (!player) return false;
+        auto it = player->m_holdingButtons.find(static_cast<int>(PlayerButton::Jump));
+        return it != player->m_holdingButtons.end() && it->second;
+    }
 
+    void syncHeld(PlayLayer* layer) {
+        buf.chan[0].resetPending();
+        buf.chan[1].resetPending();
+        buf.chan[0].realInput = buf.chan[0].appliedInput = gameHolds(layer->m_player1);
+        buf.chan[1].realInput = buf.chan[1].appliedInput = gameHolds(layer->m_player2);
+    }
+
+    // -------------------------------------------------------------------------
+    // Proactive Moving-Object & Trigger Kinematics Engine
+    // -------------------------------------------------------------------------
+    struct Watched {
+        double x = 0.0;
+        double y = 0.0;
+        int movedTick = -200;
+        double vx = 0.0;
+        double vy = 0.0;
+        double pvx = 0.0;
+        double pvy = 0.0;
+        double rot = 0.0;
+        double vrot = 0.0;
+    };
+
+    struct Mover {
+        GameObject* object = nullptr;
+        double x = 0.0, y = 0.0, vx = 0.0, vy = 0.0;
+        double turn = 0.0;
+        double rotX = 0.0, rotY = 0.0, vrot = 0.0;
+        double ax = 0.0, ay = 0.0;
+        int accelSteps = 0;
+    };
+
+    enum class TriggerKind { Move, Rotate, Toggle, Spawn };
+
+    struct LevelTrigger {
+        EffectGameObject* trigger = nullptr;
+        double x = 0.0;
+        TriggerKind kind = TriggerKind::Move;
+        bool touchTriggered = false;
+        CCRect touchRect {};
+    };
+
+    struct ScriptedMove {
+        TriggerKind kind = TriggerKind::Move;
+        double x = 0.0;
+        bool touchTriggered = false;
+        CCRect touchRect {};
+        int fireStep = -1;
+        double dx = 0.0, dy = 0.0;
+        bool lockPlayerX = false, lockPlayerY = false;
+        double anchorPlayerX = 0.0, anchorPlayerY = 0.0;
+        double angle = 0.0;
+        bool hasCenter = false;
+        double cx = 0.0, cy = 0.0;
+        bool lockRot = false;
+        double steps = 0.0;
+        int easing = 0;
+        double rate = 0.0;
+        double from = 0.0;
+        CCArray* group = nullptr;
+        bool on = false;
+        bool armed = false;
+        int delay = 0;
+        bool toggled = false;
+    };
+
+    struct ScriptedObject {
+        GameObject* object = nullptr;
+        double x = 0.0, y = 0.0;
+        CCPoint node {};
+        float rotX = 0.f, rotY = 0.f;
+        bool mover = false;
+        bool placed = false;
+        bool rotated = false;
+        std::vector<int> moves;
+        double lastX = 0.0, lastY = 0.0, lastSpin = 0.0;
+    };
+
+    struct PendingSpawn {
+        int group = 0;
+        int at = 0;
+    };
+
+    struct ScriptedCache {
+        GJBaseGameLayer* layer = nullptr;
+        int tick = -1;
+        double px = 0.0, reach = 0.0;
+        bool goingLeft = false;
+        std::vector<ScriptedMove> moves;
+        std::vector<ScriptedObject> objects;
+    };
+
+    constexpr size_t WATCH_LIMIT = 4096;
+    constexpr int SCRIPTED_TRIGGER_LIMIT = 64;
+    constexpr int SCRIPTED_OBJECT_LIMIT = 192;
+
+    std::unordered_map<GameObject*, Watched> watched;
+    std::vector<GameObject*> movingNow;
+    std::vector<Mover> movers;
+
+    std::vector<GameObject*> levelColliders;
+    std::vector<LevelTrigger> levelTriggers;
+    GJBaseGameLayer* indexedLayer = nullptr;
+    unsigned indexedObjCount = 0;
+
+    std::unordered_map<EffectGameObject*, int> firedMoves;
+    std::vector<PendingSpawn> pendingSpawns;
+    std::vector<ScriptedMove> scriptedMoves;
+    std::vector<ScriptedObject> scriptedObjects;
+    ScriptedCache scriptedCache;
+
+    void forgetLevelIndex() {
+        watched.clear();
+        movingNow.clear();
+        movers.clear();
+        levelColliders.clear();
+        levelTriggers.clear();
+        indexedLayer = nullptr;
+        indexedObjCount = 0;
+        firedMoves.clear();
+        pendingSpawns.clear();
+        scriptedMoves.clear();
+        scriptedObjects.clear();
+        scriptedCache = {};
+    }
+
+    bool plainTrigger(EffectGameObject* t, bool rotate) {
+        if (t->m_targetGroupID <= 0 || t->m_isDynamicMode) {
+            return false;
+        }
+        if (rotate) {
+            return t->m_rotationTargetID <= 0 && (t->m_rotationDegrees != 0.f || t->m_times360 != 0);
+        }
+        if (t->m_useMoveTarget || t->m_lockToCameraX || t->m_lockToCameraY) {
+            return false;
+        }
+        return t->m_lockToPlayerX || t->m_lockToPlayerY || t->m_moveOffset.x != 0.f || t->m_moveOffset.y != 0.f;
+    }
+
+    bool plainSpawn(EffectGameObject* t) {
+        auto* s = static_cast<SpawnTriggerGameObject*>(t);
+        return t->m_targetGroupID > 0 && s->m_delayRange <= 0.f && s->m_remapObjects.empty() && !t->m_spawnOrdered;
+    }
+
+    int spawnSteps(EffectGameObject* t, float tickLength) {
+        return static_cast<int>(std::lround(std::max(0.f, static_cast<SpawnTriggerGameObject*>(t)->m_spawnDelay) * 60.0 / tickLength));
+    }
+
+    void ensureLevelIndexed(GJBaseGameLayer* layer) {
+        unsigned count = layer->m_objects ? layer->m_objects->count() : 0;
+        if (layer == indexedLayer && count == indexedObjCount) {
+            return;
+        }
+        indexedLayer = layer;
+        indexedObjCount = count;
+        levelColliders.clear();
+        levelTriggers.clear();
+        if (!layer->m_objects) {
+            return;
+        }
+        constexpr uint64_t trackMask = COLLIDING_TYPES | INTERACT_TYPES;
+        levelColliders.reserve(std::min<unsigned>(count, 4096));
+
+        for (auto* object : CCArrayExt<GameObject*>(layer->m_objects)) {
+            if (!object) continue;
+            int id = object->m_objectID;
+            if (id == 901 || id == 1346 || id == 1049 || id == 1268) {
+                auto* t = static_cast<EffectGameObject*>(object);
+                if (!t->m_isSpawnTriggered) {
+                    bool touch = t->m_isTouchTriggered;
+                    CCRect tr = touch ? t->getObjectRect() : CCRect {};
+                    if (id == 1049 && t->m_targetGroupID > 0) {
+                        levelTriggers.push_back({ t, t->m_positionX, TriggerKind::Toggle, touch, tr });
+                    } else if (id == 1268 && plainSpawn(t)) {
+                        levelTriggers.push_back({ t, t->m_positionX, TriggerKind::Spawn, touch, tr });
+                    } else if ((id == 901 || id == 1346) && plainTrigger(t, id == 1346)) {
+                        levelTriggers.push_back({ t, t->m_positionX, id == 1346 ? TriggerKind::Rotate : TriggerKind::Move, touch, tr });
+                    }
+                }
+            }
+            if (!object->m_isDecoration && object->m_objectType != GameObjectType::Decoration) {
+                auto type = static_cast<unsigned>(object->m_objectType);
+                uint64_t bit = type < 64 ? (1ull << type) : 0;
+                if (trackMask & bit) {
+                    levelColliders.push_back(object);
+                }
+            }
+        }
+        std::sort(levelTriggers.begin(), levelTriggers.end(), [](auto const& a, auto const& b) { return a.x < b.x; });
+        std::sort(levelColliders.begin(), levelColliders.end(), [](GameObject* a, GameObject* b) { return a->m_positionX < b->m_positionX; });
+    }
+
+    void watchObject(GameObject* object) {
+        auto [it, added] = watched.try_emplace(object, Watched { object->m_positionX, object->m_positionY, -200 });
+        if (added) {
+            it->second.rot = object->getRotation();
+        }
+    }
+
+    // Proactively watches nearby colliders & active trigger groups BEFORE you click so first-click
+    // predictions already have exact 2-step velocity, acceleration, orbital turn, and spin.
+    void updateWatched(GJBaseGameLayer* layer) {
+        if (!Buffer::predictMovers || !layer || !layer->m_player1) {
+            return;
+        }
+        ensureLevelIndexed(layer);
+        if (watched.size() > WATCH_LIMIT) {
+            watched.clear();
+        }
+        double px = layer->m_player1->getPosition().x;
+        double py = layer->m_player1->getPosition().y;
+
+        auto lo = std::lower_bound(levelColliders.begin(), levelColliders.end(), px - 180.0,
+            [](GameObject* o, double x) { return o->m_positionX < x; });
+        int scanned = 0;
+        for (auto it = lo; it != levelColliders.end() && (*it)->m_positionX <= px + 720.0 && scanned < 180; ++it, ++scanned) {
+            auto* obj = *it;
+            if (!obj->m_isDisabled && std::abs(obj->m_positionY - py) <= 460.0) {
+                watchObject(obj);
+            }
+        }
+
+        movingNow.clear();
+        for (auto it = watched.begin(); it != watched.end();) {
+            auto* object = it->first;
+            auto& w = it->second;
+            if (std::abs(object->m_positionX - px) > 900.0) {
+                it = watched.erase(it);
+                continue;
+            }
+            double rot = object->getRotation();
+            if (object->m_positionX != w.x || object->m_positionY != w.y || rot != w.rot) {
+                bool consecutive = (tickCount - w.movedTick == 1);
+                w.pvx = consecutive ? w.vx : 0.0;
+                w.pvy = consecutive ? w.vy : 0.0;
+                w.vx = object->m_positionX - w.x;
+                w.vy = object->m_positionY - w.y;
+                w.vrot = std::remainder(rot - w.rot, 360.0);
+                w.x = object->m_positionX;
+                w.y = object->m_positionY;
+                w.rot = rot;
+                w.movedTick = tickCount;
+                movingNow.push_back(object);
+            } else if (tickCount - w.movedTick > 1) {
+                w.vx = w.vy = w.pvx = w.pvy = w.vrot = 0.0;
+            }
+            ++it;
+        }
+    }
+
+    void collectMovers() {
+        movers.clear();
+        if (!Buffer::predictMovers) return;
+        for (auto* object : movingNow) {
+            auto it = watched.find(object);
+            if (it == watched.end()) continue;
+            auto const& w = it->second;
+            if ((w.vx != 0.0 || w.vy != 0.0 || w.vrot != 0.0) && tickCount - w.movedTick <= 1) {
+                Mover m { object, object->m_positionX, object->m_positionY, w.vx, w.vy };
+                double speed = std::hypot(w.vx, w.vy);
+                double prev = std::hypot(w.pvx, w.pvy);
+                if (speed > 1e-6 && prev > 1e-6) {
+                    double turn = std::remainder(std::atan2(w.vy, w.vx) - std::atan2(w.pvy, w.pvx), 6.283185307179586);
+                    double ratio = speed / prev;
+                    if (std::abs(turn) > 1e-4 && std::abs(turn) < 0.5 && ratio > 0.8 && ratio < 1.25) {
+                        m.turn = turn;
+                    } else if (std::abs(turn) <= 1e-4 && std::abs(ratio - 1.0) > 1e-3 && ratio > 0.5 && ratio < 2.0) {
+                        m.ax = w.vx - w.pvx;
+                        m.ay = w.vy - w.pvy;
+                        double along = (m.ax * w.vx + m.ay * w.vy) / speed;
+                        double steps = along < 0.0 ? speed / -along : 2.0 * speed / along;
+                        m.accelSteps = static_cast<int>(std::min(steps, 1000.0));
+                    }
+                }
+                m.rotX = object->getRotationX();
+                m.rotY = object->getRotationY();
+                m.vrot = w.vrot;
+                movers.push_back(m);
+            }
+        }
+    }
+
+    void placeMovers(int steps) {
+        for (auto const& m : movers) {
+            double x = m.x + m.vx * steps;
+            double y = m.y + m.vy * steps;
+            if (m.accelSteps > 0 && steps > 0) {
+                int n = std::min(steps, m.accelSteps);
+                double grow = 0.5 * n * (n + 1);
+                x = m.x + m.vx * steps + m.ax * (grow + static_cast<double>(n) * (steps - n));
+                y = m.y + m.vy * steps + m.ay * (grow + static_cast<double>(n) * (steps - n));
+            }
+            if (m.turn != 0.0 && steps > 0) {
+                std::complex<double> v { m.vx, m.vy };
+                auto rho = std::polar(1.0, m.turn);
+                auto moved = v * rho * (1.0 - std::pow(rho, steps)) / (1.0 - rho);
+                x = m.x + moved.real();
+                y = m.y + moved.imag();
+            }
+            if (m.vrot != 0.0) {
+                double spun = steps == 0 ? 0.0 : m.vrot * steps;
+                m.object->setRotationX(static_cast<float>(m.rotX + spun));
+                m.object->setRotationY(static_cast<float>(m.rotY + spun));
+            }
+            m.object->setPosition({ static_cast<float>(x), static_cast<float>(y) });
+            m.object->m_positionX = x;
+            m.object->m_positionY = y;
+            m.object->setObjectRectDirty(true);
+            m.object->m_isOrientedBoxDirty = true;
+        }
+    }
+
+    double easeMove(int type, double rate, double t) {
+        constexpr double PI = 3.141592653589793;
+        t = std::clamp(t, 0.0, 1.0);
+        if (t <= 0.0 || t >= 1.0) return t;
+        rate = rate > 0.0 ? rate : 2.0;
+        auto bounce = [](double u) {
+            if (u < 1.0 / 2.75) return 7.5625 * u * u;
+            if (u < 2.0 / 2.75) { u -= 1.5 / 2.75; return 7.5625 * u * u + 0.75; }
+            if (u < 2.5 / 2.75) { u -= 2.25 / 2.75; return 7.5625 * u * u + 0.9375; }
+            u -= 2.625 / 2.75;
+            return 7.5625 * u * u + 0.984375;
+        };
+        double period = (rate > 0.0 && rate < 2.0) ? rate : 0.3;
+        double s = period / 4.0;
+        constexpr double BACK = 1.70158;
+        switch (type) {
+            case 1: {
+                double u = t * 2.0;
+                return u < 1.0 ? 0.5 * std::pow(u, rate) : 1.0 - 0.5 * std::pow(2.0 - u, rate);
+            }
+            case 2: return std::pow(t, rate);
+            case 3: return std::pow(t, 1.0 / rate);
+            case 4: {
+                double u = t * 2.0 - 1.0;
+                return u < 0.0 ? -0.5 * std::pow(2.0, 10.0 * u) * std::sin((u - s) * 2.0 * PI / period)
+                               : std::pow(2.0, -10.0 * u) * std::sin((u - s) * 2.0 * PI / period) * 0.5 + 1.0;
+            }
+            case 5: {
+                double u = t - 1.0;
+                return -std::pow(2.0, 10.0 * u) * std::sin((u - s) * 2.0 * PI / period);
+            }
+            case 6: return std::pow(2.0, -10.0 * t) * std::sin((t - s) * 2.0 * PI / period) + 1.0;
+            case 7: return t < 0.5 ? (1.0 - bounce(1.0 - t * 2.0)) * 0.5 : bounce(t * 2.0 - 1.0) * 0.5 + 0.5;
+            case 8: return 1.0 - bounce(1.0 - t);
+            case 9: return bounce(t);
+            case 10: {
+                double u = t * 2.0;
+                return u < 1.0 ? 0.5 * std::pow(2.0, 10.0 * (u - 1.0)) : 0.5 * (2.0 - std::pow(2.0, -10.0 * (u - 1.0)));
+            }
+            case 11: return std::pow(2.0, 10.0 * (t - 1.0));
+            case 12: return 1.0 - std::pow(2.0, -10.0 * t);
+            case 13: return -0.5 * (std::cos(PI * t) - 1.0);
+            case 14: return 1.0 - std::cos(t * PI / 2.0);
+            case 15: return std::sin(t * PI / 2.0);
+            case 16: {
+                double o = BACK * 1.525;
+                double u = t * 2.0;
+                if (u < 1.0) return u * u * ((o + 1.0) * u - o) / 2.0;
+                u -= 2.0;
+                return u * u * ((o + 1.0) * u + o) / 2.0 + 1.0;
+            }
+            case 17: return t * t * ((BACK + 1.0) * t - BACK);
+            case 18: {
+                double u = t - 1.0;
+                return u * u * ((BACK + 1.0) * u + BACK) + 1.0;
+            }
+            default: return t;
+        }
+    }
+
+    GameObject* groupParentOf(GJBaseGameLayer* layer, int group) {
+        if (group <= 0 || !layer->m_parentGroupsDict) return nullptr;
+        return typeinfo_cast<GameObject*>(layer->m_parentGroupsDict->objectForKey(group));
+    }
+
+    void fillMove(GJBaseGameLayer* layer, EffectGameObject* t, TriggerKind kind, float tickLength, ScriptedMove& m) {
+        m.kind = kind;
+        m.steps = t->m_duration * 60.0 / tickLength;
+        m.easing = static_cast<int>(t->m_easingType);
+        m.rate = t->m_easingRate;
+        if (kind == TriggerKind::Move) {
+            m.dx = t->m_moveOffset.x;
+            m.dy = t->m_moveOffset.y;
+            m.lockPlayerX = t->m_lockToPlayerX;
+            m.lockPlayerY = t->m_lockToPlayerY;
+            return;
+        }
+        m.angle = t->m_rotationDegrees + 360.0 * t->m_times360;
+        m.lockRot = t->m_lockObjectRotation;
+        GameObject* pivot = nullptr;
+        if (t->m_centerGroupID > 0) {
+            pivot = groupParentOf(layer, t->m_centerGroupID);
+            if (!pivot) {
+                auto* center = layer->getGroup(t->m_centerGroupID);
+                if (center && center->count() > 0) {
+                    pivot = static_cast<GameObject*>(center->objectAtIndex(0));
+                }
+            }
+        } else {
+            pivot = groupParentOf(layer, t->m_targetGroupID);
+        }
+        if (pivot) {
+            m.hasCenter = true;
+            m.cx = pivot->m_positionX;
+            m.cy = pivot->m_positionY;
+        }
+    }
+
+    void applyMove(ScriptedMove const& m, double f, double ghostX, double ghostY, bool activeLock, double& x, double& y, double& spin) {
+        if (m.kind == TriggerKind::Move) {
+            x += m.dx * f;
+            y += m.dy * f;
+            if (activeLock) {
+                if (m.lockPlayerX) x += (ghostX - m.anchorPlayerX);
+                if (m.lockPlayerY) y += (ghostY - m.anchorPlayerY);
+            }
+            return;
+        }
+        if (m.kind != TriggerKind::Rotate) return;
+        double a = m.angle * f;
+        if (m.hasCenter) {
+            double th = -a * 3.141592653589793 / 180.0;
+            double rx = x - m.cx, ry = y - m.cy;
+            x = m.cx + rx * std::cos(th) - ry * std::sin(th);
+            y = m.cy + rx * std::sin(th) + ry * std::cos(th);
+        }
+        if (!m.lockRot) {
+            spin += a;
+        }
+    }
+
+    void simToggle(CCArray* group, bool on) {
+        int seen = 0;
+        for (auto* object : CCArrayExt<GameObject*>(group)) {
+            if (!object || ++seen > 2000) break;
+            if (!on) {
+                if (!vecContains(buf.simDisabled, object)) {
+                    buf.simDisabled.push_back(object);
+                }
+                continue;
+            }
+            std::erase(buf.simDisabled, object);
+            if (object->m_isGroupDisabled && buf.simEnabled.size() < 256 && !vecContains(buf.simEnabled, object)) {
+                buf.simEnabled.push_back(object);
+            }
+        }
+    }
+
+    void collectScripted(GJBaseGameLayer* layer, int total) {
+        scriptedMoves.clear();
+        scriptedObjects.clear();
+        if (!Buffer::predictTriggers || !buf.ghost1 || !layer->m_player1) {
+            return;
+        }
+        bool goingLeft = buf.ghost1->m_isGoingLeft;
+        double px = buf.ghost1->getPositionX();
+        double py = buf.ghost1->getPositionY();
+        double speedStep = std::max(static_cast<double>(std::abs(buf.tickDeltaCoord[0])), 2.2);
+        double reach = (total + 4) * speedStep + 40.0;
+
+        auto& cache = scriptedCache;
+        if (cache.layer == layer && cache.tick == tickCount && cache.goingLeft == goingLeft &&
+            reach <= cache.reach && std::abs(px - cache.px) < 3.0) {
+            scriptedMoves = cache.moves;
+            scriptedObjects = cache.objects;
+            for (auto& m : scriptedMoves) {
+                if (m.armed && (m.lockPlayerX || m.lockPlayerY)) {
+                    m.anchorPlayerX = px;
+                    m.anchorPlayerY = py;
+                }
+            }
+            return;
+        }
+
+        ensureLevelIndexed(layer);
+        float tickLength = (buf.tickLength > 0.001f && buf.tickLength < 2.f) ? buf.tickLength : TICK;
+        std::unordered_map<GameObject*, size_t> index;
+
+        double pathMinX = goingLeft ? (px - reach - 90.0) : (px - 90.0);
+        double pathMaxX = goingLeft ? (px + 90.0) : (px + reach + 90.0);
+        double pathMinY = py - 460.0, pathMaxY = py + 460.0;
+
+        auto nearPath = [&](GameObject* object, ScriptedMove const& m) {
+            if (m.lockPlayerX || m.lockPlayerY) return true;
+            double x = object->m_positionX, y = object->m_positionY;
+            double x0 = x, x1 = x, y0 = y, y1 = y;
+            if (m.kind == TriggerKind::Move) {
+                x0 = std::min(x, x + m.dx);
+                x1 = std::max(x, x + m.dx);
+                y0 = std::min(y, y + m.dy);
+                y1 = std::max(y, y + m.dy);
+            } else if (m.hasCenter) {
+                double r = std::hypot(x - m.cx, y - m.cy);
+                x0 = m.cx - r; x1 = m.cx + r;
+                y0 = m.cy - r; y1 = m.cy + r;
+            }
+            constexpr double SIZE = 65.0;
+            return x1 + SIZE >= pathMinX && x0 - SIZE <= pathMaxX && y1 + SIZE >= pathMinY && y0 - SIZE <= pathMaxY;
+        };
+
+        auto addMove = [&](EffectGameObject* t, double x, TriggerKind kind, bool armed, int when, bool touch, CCRect const& tr) {
+            int elapsed = (armed && when < 0) ? -when : -1;
+            if (static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT) return;
+            auto* group = layer->getGroup(t->m_targetGroupID);
+            if (!group || group->count() == 0) return;
+
+            ScriptedMove m;
+            m.kind = kind;
+            m.x = x;
+            m.touchTriggered = touch;
+            m.touchRect = tr;
+            m.armed = armed;
+            m.fireStep = armed ? when : -1;
+            m.delay = armed ? 0 : when;
+            m.anchorPlayerX = px;
+            m.anchorPlayerY = py;
+
+            if (kind == TriggerKind::Toggle) {
+                m.group = group;
+                m.on = t->m_activateGroup;
+                scriptedMoves.push_back(m);
+                return;
+            }
+            fillMove(layer, t, kind, tickLength, m);
+            if (elapsed >= 0) {
+                if (m.steps < 0.5 || elapsed >= m.steps) return;
+                m.from = easeMove(m.easing, m.rate, elapsed / m.steps);
+            }
+            int moveIdx = static_cast<int>(scriptedMoves.size());
+            bool any = false;
+            for (auto* object : CCArrayExt<GameObject*>(group)) {
+                if (!object || object == t || object->m_isDecoration || object->m_objectType == GameObjectType::Decoration ||
+                    !nearPath(object, m)) {
+                    continue;
+                }
+                bool isMover = std::any_of(movers.begin(), movers.end(), [&](Mover const& mv) { return mv.object == object; });
+                // Avoid double-extrapolating an already-running non-locked trigger if `movers` is already moving it
+                if (armed && when < 0 && isMover && !m.lockPlayerX && !m.lockPlayerY) {
+                    continue;
+                }
+                auto [found, added] = index.try_emplace(object, scriptedObjects.size());
+                if (added) {
+                    if (scriptedObjects.size() >= SCRIPTED_OBJECT_LIMIT) {
+                        index.erase(found);
+                        continue;
+                    }
+                    scriptedObjects.push_back({ object, object->m_positionX, object->m_positionY, object->getPosition(),
+                        object->getRotationX(), object->getRotationY(), isMover });
+                }
+                scriptedObjects[found->second].moves.push_back(moveIdx);
+                any = true;
+            }
+            if (any) {
+                scriptedMoves.push_back(m);
+            }
+        };
+
+        // Active in-progress triggers (especially Lock-to-Player X/Y or newly started curves)
+        for (auto fired = firedMoves.begin(); fired != firedMoves.end();) {
+            auto* t = fired->first;
+            int elapsed = tickCount - fired->second;
+            if (elapsed < 0 || elapsed * tickLength > t->m_duration * 60.f + 1.f) {
+                fired = firedMoves.erase(fired);
+                continue;
+            }
+            bool rotate = (t->m_objectID == 1346);
+            if (plainTrigger(t, rotate)) {
+                addMove(t, 0.0, rotate ? TriggerKind::Rotate : TriggerKind::Move, true, -elapsed, false, {});
+            }
+            ++fired;
+        }
+
+        std::function<void(int, double, bool, int, int, bool, CCRect const&)> spawnChain =
+            [&](int groupID, double x, bool armed, int when, int depth, bool touch, CCRect const& tr) {
+            auto* group = layer->getGroup(groupID);
+            if (!group || depth > 4) return;
+            int seen = 0;
+            for (auto* object : CCArrayExt<GameObject*>(group)) {
+                if (!object || ++seen > 600) break;
+                int id = object->m_objectID;
+                if (id != 901 && id != 1346 && id != 1049 && id != 1268) continue;
+                auto* c = static_cast<EffectGameObject*>(object);
+                if (!c->m_isSpawnTriggered) continue;
+                if (id == 1268) {
+                    if (plainSpawn(c)) {
+                        spawnChain(c->m_targetGroupID, x, armed, when + spawnSteps(c, tickLength), depth + 1, touch, tr);
+                    }
+                } else if (id == 1049) {
+                    if (c->m_targetGroupID > 0) {
+                        addMove(c, x, TriggerKind::Toggle, armed, when, touch, tr);
+                    }
+                } else if (plainTrigger(c, id == 1346)) {
+                    addMove(c, x, id == 1346 ? TriggerKind::Rotate : TriggerKind::Move, armed, when, touch, tr);
+                }
+            }
+        };
+
+        if (!pendingSpawns.empty()) {
+            std::erase_if(pendingSpawns, [](PendingSpawn const& p) { return p.at < tickCount; });
+            for (auto const& p : pendingSpawns) {
+                spawnChain(p.group, 0.0, true, p.at - tickCount, 0, false, {});
+            }
+        }
+
+        double trigMinX = goingLeft ? (px - reach) : (px - 2.0);
+        double trigMaxX = goingLeft ? (px + 2.0) : (px + reach);
+        auto it = std::lower_bound(levelTriggers.begin(), levelTriggers.end(), trigMinX,
+            [](auto const& m, double x) { return m.x < x; });
+        for (; it != levelTriggers.end() && it->x <= trigMaxX; ++it) {
+            if (it->trigger->m_activated) continue;
+            if (it->kind == TriggerKind::Spawn) {
+                spawnChain(it->trigger->m_targetGroupID, it->x, false, spawnSteps(it->trigger, tickLength), 0, it->touchTriggered, it->touchRect);
+            } else {
+                addMove(it->trigger, it->x, it->kind, false, 0, it->touchTriggered, it->touchRect);
+            }
+        }
+
+        if (scriptedMoves.empty()) {
+            scriptedObjects.clear();
+        }
+        cache.layer = layer;
+        cache.tick = tickCount;
+        cache.px = px;
+        cache.reach = reach;
+        cache.goingLeft = goingLeft;
+        cache.moves = scriptedMoves;
+        cache.objects = scriptedObjects;
+    }
+
+    void fireScripted(PlayerObject* g1, PlayerObject* g2, bool second, int tick) {
+        double gx = g1->getPositionX();
+        double gy = g1->getPositionY();
+        bool left = g1->m_isGoingLeft;
+        bool haveRects = false;
+        CCRect r1, r2;
+
+        for (auto& m : scriptedMoves) {
+            if (!m.armed) {
+                bool reached = false;
+                if (m.touchTriggered) {
+                    if (!haveRects) {
+                        r1 = g1->getObjectRect();
+                        if (second && g2) r2 = g2->getObjectRect();
+                        haveRects = true;
+                    }
+                    reached = r1.intersectsRect(m.touchRect) || (second && g2 && r2.intersectsRect(m.touchRect));
+                } else {
+                    reached = left ? (gx <= m.x) : (gx >= m.x);
+                }
+                if (reached) {
+                    m.armed = true;
+                    m.fireStep = tick + m.delay;
+                    m.anchorPlayerX = gx;
+                    m.anchorPlayerY = gy;
+                }
+            }
+            if (m.kind == TriggerKind::Toggle && m.armed && !m.toggled && tick >= m.fireStep && m.group) {
+                m.toggled = true;
+                simToggle(m.group, m.on);
+            }
+        }
+    }
+
+    void placeScripted(int step, double ghostX, double ghostY) {
+        for (auto& o : scriptedObjects) {
+            double x = o.mover ? o.object->m_positionX : o.x;
+            double y = o.mover ? o.object->m_positionY : o.y;
+            double spin = 0.0;
+            bool any = false;
+            for (int i : o.moves) {
+                auto const& m = scriptedMoves[i];
+                if (!m.armed || step <= m.fireStep) continue;
+                int elapsed = step - m.fireStep;
+                double f = (m.steps < 0.5 ? 1.0 : easeMove(m.easing, m.rate, elapsed / m.steps)) - m.from;
+                bool activeLock = (m.lockPlayerX || m.lockPlayerY) && (m.steps < 0.5 || elapsed <= m.steps);
+                if (f == 0.0 && !activeLock) continue;
+                any = true;
+                applyMove(m, f, ghostX, ghostY, activeLock, x, y, spin);
+            }
+            if (!any && !o.placed) continue;
+            if (o.placed && !o.mover && x == o.lastX && y == o.lastY && spin == o.lastSpin) continue;
+            o.lastX = x;
+            o.lastY = y;
+            o.lastSpin = spin;
+            o.object->setPosition({ static_cast<float>(x), static_cast<float>(y) });
+            o.object->m_positionX = x;
+            o.object->m_positionY = y;
+            if (!o.mover && (spin != 0.0 || o.rotated)) {
+                o.object->setRotationX(static_cast<float>(o.rotX + spin));
+                o.object->setRotationY(static_cast<float>(o.rotY + spin));
+                o.rotated = true;
+            }
+            o.object->setObjectRectDirty(true);
+            o.object->m_isOrientedBoxDirty = true;
+            o.placed = true;
+        }
+    }
+
+    void restoreScripted() {
+        for (auto& o : scriptedObjects) {
+            if (o.placed && !o.mover) {
+                o.object->setPosition(o.node);
+                o.object->m_positionX = o.x;
+                o.object->m_positionY = o.y;
+                if (o.rotated) {
+                    o.object->setRotationX(o.rotX);
+                    o.object->setRotationY(o.rotY);
+                }
+                o.object->setObjectRectDirty(true);
+                o.object->m_isOrientedBoxDirty = true;
+            }
+        }
+        scriptedObjects.clear();
+        scriptedMoves.clear();
+    }
+
+    // -------------------------------------------------------------------------
+    // Ghost Lifecycle, State Copy & Portal Transitions
+    // -------------------------------------------------------------------------
     void dropGhosts() {
         for (auto** g : { &buf.ghost1, &buf.ghost2 }) {
             if (*g) {
@@ -419,7 +1200,10 @@ namespace {
         }
         buf.simulating = false;
         buf.injecting = false;
-        buf.ghostNeedsModeRestore = false;
+        buf.ghostNeedsModeRestore1 = false;
+        buf.ghostNeedsModeRestore2 = false;
+        buf.owner = nullptr;
+        forgetLevelIndex();
         buf.chan[0].fullReset();
         buf.chan[1].fullReset();
     }
@@ -438,14 +1222,39 @@ namespace {
     }
 
     void sweepGhostLayer() {
-        if (!buf.ghostLayer) {
-            return;
-        }
+        if (!buf.ghostLayer) return;
         auto* children = buf.ghostLayer->getChildren();
         while (children && children->count() > buf.ghostLayerBase) {
             auto* node = static_cast<CCNode*>(children->lastObject());
             buf.ghostLayer->removeChild(node, true);
         }
+    }
+
+    void markLevelNodes(PlayLayer* layer) {
+        buf.levelMarks.clear();
+        auto add = [](CCNode* n) {
+            if (n) buf.levelMarks.push_back({ n, n->getChildrenCount() });
+        };
+        add(layer);
+        add(layer->m_objectLayer);
+        if (layer->m_aboveShaderObjectLayer != layer->m_objectLayer) {
+            add(layer->m_aboveShaderObjectLayer);
+        }
+        if (layer->m_objectLayer && layer->m_objectLayer->getChildren()) {
+            for (auto* child : CCArrayExt<CCNode*>(layer->m_objectLayer->getChildren())) {
+                add(child);
+            }
+        }
+    }
+
+    void sweepLevelNodes() {
+        for (auto const& m : buf.levelMarks) {
+            auto* kids = m.node->getChildren();
+            while (kids && kids->count() > m.count) {
+                m.node->removeChild(static_cast<CCNode*>(kids->lastObject()), true);
+            }
+        }
+        buf.levelMarks.clear();
     }
 
     void sendButton(PlayLayer* layer, int chIdx, bool down) {
@@ -458,17 +1267,28 @@ namespace {
     void pressGhost(PlayerObject* ghost, bool down) {
         (ghost == buf.ghost1 ? buf.held1 : buf.held2) = down;
         if (down) {
-            if (ghost->m_controlsDisabled || ghost->m_isLocked) {
-                return;
-            }
+            if (ghost->m_controlsDisabled || ghost->m_isLocked) return;
             ghost->pushButton(PlayerButton::Jump);
         } else {
             ghost->releaseButton(PlayerButton::Jump);
         }
     }
 
-    void setGhostMode(PlayerObject* ghost, GameObjectType type) {
+    bool setGhostMode(PlayerObject* ghost, GameObjectType type) {
         using T = GameObjectType;
+        switch (type) {
+            case T::CubePortal:
+            case T::ShipPortal:
+            case T::BallPortal:
+            case T::UfoPortal:
+            case T::WavePortal:
+            case T::RobotPortal:
+            case T::SpiderPortal:
+            case T::SwingPortal:
+                break;
+            default:
+                return false;
+        }
         bool now = (type == T::ShipPortal && ghost->m_isShip) ||
                    (type == T::BallPortal && ghost->m_isBall) ||
                    (type == T::UfoPortal && ghost->m_isBird) ||
@@ -478,11 +1298,10 @@ namespace {
                    (type == T::SwingPortal && ghost->m_isSwing) ||
                    (type == T::CubePortal && !ghost->m_isShip && !ghost->m_isBall && !ghost->m_isBird &&
                     !ghost->m_isDart && !ghost->m_isRobot && !ghost->m_isSpider && !ghost->m_isSwing);
-        if (now) {
-            return;
-        }
+        if (now) return true;
+
         buf.ghostSwitched = true;
-        buf.ghostNeedsModeRestore = true;
+        (ghost == buf.ghost1 ? buf.ghostNeedsModeRestore1 : buf.ghostNeedsModeRestore2) = true;
         if (ghost->m_isShip) ghost->toggleFlyMode(false, true);
         if (ghost->m_isBall) ghost->toggleRollMode(false, true);
         if (ghost->m_isBird) ghost->toggleBirdMode(false, true);
@@ -500,6 +1319,7 @@ namespace {
             case T::SwingPortal: ghost->toggleSwingMode(true, true); break;
             default: break;
         }
+        return true;
     }
 
     void syncGhostModeToReal(PlayerObject* ghost, PlayerObject* real) {
@@ -519,8 +1339,10 @@ namespace {
 
     void copyState(PlayerObject* ghost, PlayerObject* real) {
         ghost->setVisible(false);
-        if (buf.ghostNeedsModeRestore) {
+        bool& needsRestore = (ghost == buf.ghost1) ? buf.ghostNeedsModeRestore1 : buf.ghostNeedsModeRestore2;
+        if (needsRestore) {
             syncGhostModeToReal(ghost, real);
+            needsRestore = false;
         }
         if (ghost->m_touchingRings && ghost->m_touchingRings->count() > 0) {
             ghost->m_touchingRings->removeAllObjects();
@@ -546,6 +1368,13 @@ namespace {
         ghost->m_lastActivatedPortal = real->m_lastActivatedPortal;
 
         CCPoint pos = real->getPosition();
+        if (buf.ghostShiftX != 0.f) {
+            if (real->m_isSideways) {
+                pos.y += (real->m_isGoingLeft ? -buf.ghostShiftX : buf.ghostShiftX);
+            } else {
+                pos.x += (real->m_isGoingLeft ? -buf.ghostShiftX : buf.ghostShiftX);
+            }
+        }
         ghost->setPosition(pos);
         ghost->m_position = pos;
         ghost->m_lastPosition = real->m_lastPosition;
@@ -665,8 +1494,75 @@ namespace {
         ghost->m_isOrientedBoxDirty = true;
     }
 
+    bool ghostTeleport(PlayerObject* g, GameObject* object) {
+        if (object->m_objectType != GameObjectType::TeleportPortal) return false;
+        if (object->m_objectID != 747) {
+            return object->m_objectID == 749;
+        }
+        auto* t = static_cast<TeleportPortalObject*>(object);
+        if (t->m_staticForceEnabled || t->m_redirectForceEnabled || t->m_redirectDash) {
+            return false;
+        }
+        double dx = 0.0, dy = t->m_teleportYOffset;
+        if (t->m_orangePortal && t->m_orangePortal != t) {
+            dx = t->m_orangePortal->m_positionX - t->m_positionX;
+            dy = t->m_orangePortal->m_positionY - t->m_positionY;
+        }
+        if (t->m_ignoreX) dx = 0.0;
+        if (t->m_ignoreY) dy = 0.0;
+
+        if (dx != 0.0 || dy != 0.0) {
+            CCPoint shift { static_cast<float>(dx), static_cast<float>(dy) };
+            CCPoint pos = g->getPosition() + shift;
+            g->setPosition(pos);
+            g->m_position = pos;
+            g->m_lastPosition = g->m_lastPosition + shift;
+            g->m_isOnGround = false;
+            g->setObjectRectDirty(true);
+            g->m_isOrientedBoxDirty = true;
+        }
+        // Support gravity-flipping & gravity-setting teleport portals
+        if (t->m_gravityMode == 1) {
+            g->flipGravity(false, true);
+        } else if (t->m_gravityMode == 2) {
+            g->flipGravity(true, true);
+        } else if (t->m_gravityMode == 3) {
+            g->flipGravity(!g->m_isUpsideDown, true);
+        }
+        buf.ghostSwitched = true;
+        return true;
+    }
+
+    bool ghostSoloPortal(GameObject* object) {
+        if (object->m_objectType != GameObjectType::SoloPortal) return false;
+        buf.ghostSolo = true;
+        buf.simSecond = false;
+        return true;
+    }
+
+    bool ghostDualPortal(PlayerObject* g, GameObject* object) {
+        if (object->m_objectType != GameObjectType::DualPortal) return false;
+        if (buf.simSecond) return true;
+        if (g != buf.ghost1 || !buf.ghost2) return false;
+        auto* g2 = buf.ghost2;
+        float savedShift = buf.ghostShiftX;
+        buf.ghostShiftX = 0.f;
+        copyState(g2, g);
+        buf.ghostShiftX = savedShift;
+        buf.ghostNeedsModeRestore2 = true;
+        g2->setPosition(g->getPosition());
+        g2->m_position = g->m_position;
+        g2->m_lastPosition = g->m_lastPosition;
+        g2->flipGravity(!g->m_isUpsideDown, true);
+        pressGhost(g2, buf.held1);
+        buf.simSecond = true;
+        buf.ghostSolo = false;
+        buf.ghostSwitched = true;
+        return true;
+    }
+
     // -------------------------------------------------------------------------
-    // Hold Statistics (Tap & Robot Hold Estimation)
+    // Hold Statistics & Per-Ghost Object Snapshots
     // -------------------------------------------------------------------------
     constexpr int HOLD_SAMPLES = 8;
 
@@ -682,9 +1578,7 @@ namespace {
         }
 
         int pick(int fallback, int percent) const {
-            if (count == 0) {
-                return fallback;
-            }
+            if (count == 0) return fallback;
             int tmp[HOLD_SAMPLES];
             std::copy(samples, samples + count, tmp);
             int at = std::min(count - 1, count * percent / 100);
@@ -696,12 +1590,8 @@ namespace {
     HoldStats tapHold, robotHold;
 
     InputKind kindOf(PlayerObject* p) {
-        if (!p || p->m_isShip) {
-            return InputKind::Other;
-        }
-        if (p->m_isDart) {
-            return InputKind::Wave;
-        }
+        if (!p || p->m_isShip) return InputKind::Other;
+        if (p->m_isDart) return InputKind::Wave;
         return p->m_isRobot ? InputKind::Robot : InputKind::Tap;
     }
 
@@ -728,9 +1618,7 @@ namespace {
             ch.pressKind = kindOf(target);
             return;
         }
-        if (ch.pressTick < 0) {
-            return;
-        }
+        if (ch.pressTick < 0) return;
         int held = tickCount - ch.pressTick;
         ch.pressTick = -1;
         switch (ch.pressKind) {
@@ -744,9 +1632,6 @@ namespace {
         return tapHold.pick(st(12), 50);
     }
 
-    // -------------------------------------------------------------------------
-    // Object State Snapshots & Per-Ghost Usage Tracking
-    // -------------------------------------------------------------------------
     ObjSnapshot* findSnapshot(GameObject* object) {
         for (auto& s : buf.snapshots) {
             if (s.object == object) return &s;
@@ -758,12 +1643,13 @@ namespace {
         if (auto* existing = findSnapshot(object)) {
             return *existing;
         }
-        ObjSnapshot s { object, object->m_isActivated, nullptr, false, false, false };
+        ObjSnapshot s { object, object->m_isActivated, nullptr, false, false, false, false };
         if (auto* effect = typeinfo_cast<EffectGameObject*>(object)) {
             s.effect = effect;
             s.activated = effect->m_activated;
             s.byP1 = effect->m_activatedByPlayer1;
             s.byP2 = effect->m_activatedByPlayer2;
+            s.animated = effect->m_animationTriggered;
         }
         buf.snapshots.push_back(s);
         return buf.snapshots.back();
@@ -780,10 +1666,7 @@ namespace {
     void markSimUsedByGhost(GameObject* obj, PlayerObject* ghost) {
         uint8_t mask = (ghost == buf.ghost1) ? 1 : 2;
         for (auto& p : buf.simUsed) {
-            if (p.first == obj) {
-                p.second |= mask;
-                return;
-            }
+            if (p.first == obj) { p.second |= mask; return; }
         }
         buf.simUsed.push_back({ obj, mask });
     }
@@ -799,31 +1682,32 @@ namespace {
     void markOrbUsedByGhost(GameObject* ring, PlayerObject* ghost) {
         uint8_t mask = (ghost == buf.ghost1) ? 1 : 2;
         for (auto& p : buf.orbsUsed) {
-            if (p.first == ring) {
-                p.second |= mask;
-                return;
-            }
+            if (p.first == ring) { p.second |= mask; return; }
         }
         buf.orbsUsed.push_back({ ring, mask });
     }
 
     void restoreObjects() {
+        sweepLevelNodes();
         for (auto const& s : buf.snapshots) {
             s.object->m_isActivated = s.isActivated;
             if (s.effect) {
                 s.effect->m_activated = s.activated;
                 s.effect->m_activatedByPlayer1 = s.byP1;
                 s.effect->m_activatedByPlayer2 = s.byP2;
+                s.effect->m_animationTriggered = s.animated;
             }
         }
         buf.snapshots.clear();
         buf.simUsed.clear();
         buf.orbsUsed.clear();
         buf.simDisabled.clear();
+        buf.simEnabled.clear();
     }
 
     inline void advanceGhost(PlayerObject* ghost, float dt) {
         ghost->update(dt);
+        ghost->updateRotation(dt);
     }
 
     inline void checkGhost(PlayLayer* layer, PlayerObject* ghost, float dt) {
@@ -868,7 +1752,7 @@ namespace {
     enum class SimEnd { Ok, StopSearch };
 
     // -------------------------------------------------------------------------
-    // Ghost Simulation Engine
+    // Core Ghost Simulation Engine (Movers + Scripted Triggers + Portals + Dual)
     // -------------------------------------------------------------------------
     int simulate(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, bool down, int horizon, int releaseAfter, int stopAt, SimEnd* end) {
@@ -877,16 +1761,20 @@ namespace {
             return horizon;
         }
         buf.simulating = true;
+        markLevelNodes(layer);
         buf.ghostDied = false;
         buf.ghostHitPortal = false;
         buf.ghostSwitched = false;
+        buf.ghostSolo = false;
         buf.firstOrbTick = -1;
         buf.lastOrbTick = -1;
+        buf.laterOrbTouched = false;
         buf.orbUsedTick = -1;
         buf.currentDelay = delay;
         buf.g1IsRealP2 = (p1 == layer->m_player2);
 
         bool second = dual && buf.ghost2 && p2;
+        buf.simSecond = second;
         buf.haveRealRect = Buffer::ignoreTouching;
         buf.haveStartRects = true;
         buf.harmless.clear();
@@ -897,9 +1785,9 @@ namespace {
         if (second) {
             copyState(buf.ghost2, p2);
         }
-        buf.ghostNeedsModeRestore = false;
         buf.held1 = buf.held2 = initialHeld;
         buf.auto1 = buf.auto2 = false;
+        buf.autoAt1 = buf.autoAt2 = -1;
         buf.autoHold1 = buf.autoHold2 = 0;
 
         float dt = buf.tickLength;
@@ -918,6 +1806,7 @@ namespace {
 
         int maxDashHold = holdEstimate();
         int total = delay + horizon;
+        bool extendedForPortal = false;
         int survived = 0;
         int airTicks1 = 0, groundTicks1 = 0;
         int airTicks2 = 0, groundTicks2 = 0;
@@ -926,8 +1815,38 @@ namespace {
         bool died = false;
         bool safe = false;
 
+        collectMovers();
+        collectScripted(layer, total + st(28));
+
         for (; tick < total; ++tick) {
+            second = buf.simSecond;
+            if (!second) landed2 = true;
             buf.simTick = tick;
+
+            if (!movers.empty()) {
+                placeMovers(tick + 1);
+            }
+            if (!scriptedMoves.empty()) {
+                fireScripted(buf.ghost1, buf.ghost2, second, tick);
+                placeScripted(tick + 1, buf.ghost1->getPositionX(), buf.ghost1->getPositionY());
+            }
+
+            if (buf.autoAt1 >= 0 && tick >= buf.autoAt1) {
+                if (!buf.held1 && buf.ghost1->m_touchingRings && buf.ghost1->m_touchingRings->count() > 0) {
+                    buf.ghost1->pushButton(PlayerButton::Jump);
+                    buf.auto1 = true;
+                    buf.autoHold1 = 0;
+                }
+                buf.autoAt1 = -2;
+            }
+            if (second && buf.autoAt2 >= 0 && tick >= buf.autoAt2) {
+                if (!buf.held2 && buf.ghost2->m_touchingRings && buf.ghost2->m_touchingRings->count() > 0) {
+                    buf.ghost2->pushButton(PlayerButton::Jump);
+                    buf.auto2 = true;
+                    buf.autoHold2 = 0;
+                }
+                buf.autoAt2 = -2;
+            }
 
             if (tick == delay && !buf.skipPress) {
                 pressGhost(buf.ghost1, down);
@@ -955,7 +1874,7 @@ namespace {
                 }
             }
 
-            float stepDt = tick == 0 ? dt * buf.firstStep : dt;
+            float stepDt = (tick == 0) ? dt * buf.firstStep : dt;
             advanceGhost(buf.ghost1, stepDt);
             if (second) {
                 advanceGhost(buf.ghost2, stepDt);
@@ -967,7 +1886,7 @@ namespace {
             }
 
             checkGhost(layer, buf.ghost1, dt);
-            if (!buf.ghostDied && second) {
+            if (!buf.ghostDied && buf.simSecond) {
                 checkGhost(layer, buf.ghost2, dt);
             }
             if (buf.ghostDied) {
@@ -977,6 +1896,13 @@ namespace {
             if (buf.ghostHitPortal) {
                 safe = tick >= delay;
                 break;
+            }
+            // Extend post-portal survival check if a mode/teleport/dual portal triggered late in the horizon
+            if (buf.ghostSwitched && !extendedForPortal && total - tick < st(28)) {
+                int addTicks = st(28) - (total - tick);
+                total += addTicks;
+                stopAt += addTicks;
+                extendedForPortal = true;
             }
             if (tick < delay) {
                 continue;
@@ -997,31 +1923,31 @@ namespace {
                     if (spider1) {
                         if (++groundTicks1 >= st(SPIDER_LAND)) landed1 = true;
                     } else if (airTicks1 >= st(ball1 ? 2 : 6)) {
-                        if (++groundTicks1 > st(ball1 ? 6 : 2)) landed1 = true;
+                        if (++groundTicks1 > st(ball1 ? 8 : 2)) landed1 = true;
                     }
                 } else {
                     ++airTicks1;
                     groundTicks1 = 0;
                     landed1 = false;
                 }
-            } else if (survived >= st(40)) {
+            } else if (survived >= st(44)) {
                 landed1 = true;
             }
 
-            if (second) {
+            if (buf.simSecond) {
                 if (!fly2) {
                     if (buf.ghost2->m_isOnGround) {
                         if (spider2) {
                             if (++groundTicks2 >= st(SPIDER_LAND)) landed2 = true;
                         } else if (airTicks2 >= st(ball2 ? 2 : 6)) {
-                            if (++groundTicks2 > st(ball2 ? 6 : 2)) landed2 = true;
+                            if (++groundTicks2 > st(ball2 ? 8 : 2)) landed2 = true;
                         }
                     } else {
                         ++airTicks2;
                         groundTicks2 = 0;
                         landed2 = false;
                     }
-                } else if (survived >= st(40)) {
+                } else if (survived >= st(44)) {
                     landed2 = true;
                 }
             }
@@ -1032,28 +1958,37 @@ namespace {
             }
         }
 
+        restoreScripted();
+        if (!movers.empty()) {
+            placeMovers(0);
+            movers.clear();
+        }
         if ((died || buf.ghostHitPortal) && tick < delay) {
             *end = SimEnd::StopSearch;
         }
         restoreObjects();
+        buf.ghost1->stopAllActions();
+        if (buf.ghost2) buf.ghost2->stopAllActions();
         if (buf.firstOrbTick >= 0) {
             buf.ghost1->stopParticles();
-            if (buf.ghost2) {
-                buf.ghost2->stopParticles();
-            }
+            if (buf.ghost2) buf.ghost2->stopParticles();
         }
+        buf.lastRunSwitched = buf.ghostSwitched;
         buf.simulating = false;
         return safe ? horizon : survived;
     }
 
-    int currentBaseSurvival = 0;
+    // -------------------------------------------------------------------------
+    // Multi-Timing Orbs, Two-Clicks-Ahead, and Per-Gamemode Scorers
+    // -------------------------------------------------------------------------
+    bool quickScore = false;
 
     int simulateOrbs(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, bool down, int horizon, int releaseAfter, int stopAt, SimEnd* end, bool fastSubCheck = false) {
         buf.orbClick = Buffer::assumeOrbs;
         buf.touchedOrb = false;
         int first = simulate(layer, p1, p2, dual, initialHeld, delay, down, horizon, releaseAfter, stopAt, end);
-        if (fastSubCheck || !Buffer::tryBothOrbs || !buf.touchedOrb || first >= stopAt || clickOverTime()) {
+        if (fastSubCheck || quickScore || !Buffer::tryBothOrbs || !buf.touchedOrb || first >= stopAt || clickOverTime()) {
             return first;
         }
         SimEnd firstEnd = *end;
@@ -1063,11 +1998,42 @@ namespace {
         if (firstEnd != SimEnd::StopSearch) {
             *end = SimEnd::Ok;
         }
-        return std::max(first, second);
+        int best = std::max(first, second);
+        if (Buffer::orbTiming && best < stopAt && !clickOverTime()) {
+            for (int late : { 3, 6 }) {
+                buf.orbClick = true;
+                buf.orbClickDelay = st(late);
+                SimEnd lateEnd;
+                int ret = simulate(layer, p1, p2, dual, initialHeld, delay, down, horizon, releaseAfter, stopAt, &lateEnd);
+                buf.orbClickDelay = 0;
+                buf.orbClick = Buffer::assumeOrbs;
+                best = std::max(best, ret);
+                if (best >= stopAt || clickOverTime()) break;
+            }
+        }
+        return best;
     }
 
     int fullWaveHorizon(bool mini) {
-        return st(mini ? (Buffer::waveHorizon - 12) : Buffer::waveHorizon);
+        return st(mini ? (Buffer::waveHorizon - 14) : Buffer::waveHorizon);
+    }
+
+    int nextClickAt(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
+        int delay, bool down, int horizon, int releaseAfter, int ret) {
+        if (!Buffer::nextClick || ret >= horizon || ret < st(32)) {
+            return -1;
+        }
+        int length = std::min(horizon, ret + st(40));
+        for (int margin : { 8, 16, 26 }) {
+            int at = ret - st(margin);
+            if (at < st(24) || clickOverTime()) break;
+            buf.retapAt = at;
+            SimEnd e;
+            int r = simulate(layer, p1, p2, dual, initialHeld, delay, down, length, releaseAfter, length, &e);
+            buf.retapAt = -1;
+            if (r >= length) return at;
+        }
+        return -1;
     }
 
     int alignOrb(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
@@ -1080,12 +2046,44 @@ namespace {
             ~Reset() {
                 buf.orbClick = Buffer::assumeOrbs;
                 buf.orbAfterFirst = false;
+                buf.orbClickDelay = 0;
+                buf.ghostShiftX = 0.f;
             }
         } reset;
 
+        auto tryAt = [&](int k, bool* used) {
+            int best = -1;
+            *used = false;
+            for (int late : { 0, 3, 6, 10 }) {
+                buf.orbClickDelay = st(late);
+                int ret = simulate(layer, p1, p2, dual, initialHeld, k, true, horizon, releaseAfter, horizon, &end);
+                buf.orbClickDelay = 0;
+                if (late == 0) *used = (buf.orbUsedTick >= 0);
+                best = std::max(best, ret);
+                if (ret >= horizon || buf.orbUsedTick < 0 || !buf.laterOrbTouched || !Buffer::orbTiming ||
+                    end == SimEnd::StopSearch || clickOverTime()) {
+                    break;
+                }
+            }
+            return best;
+        };
+
+        auto robustAt = [&](int k) {
+            if (!Buffer::robustSaves) return true;
+            float shift = std::max(0.3f, 0.5f * (311.58f / 240.f) * (std::abs(p1->m_playerSpeed) / 0.9f));
+            for (float off : { shift, -shift }) {
+                buf.ghostShiftX = off;
+                bool used = false;
+                int ret = tryAt(k, &used);
+                buf.ghostShiftX = 0.f;
+                if (ret < horizon || !used) return false;
+            }
+            return true;
+        };
+
         buf.skipPress = true;
         buf.orbAfterFirst = false;
-        int probeLen = window + st(4);
+        int probeLen = std::min(maxDelay, std::max(window, st(36))) + 2;
         simulate(layer, p1, p2, dual, initialHeld, 0, true, probeLen, -1, probeLen, &end);
         buf.skipPress = false;
         buf.orbAfterFirst = true;
@@ -1095,21 +2093,22 @@ namespace {
             return 0;
         }
 
-        int now = simulate(layer, p1, p2, dual, initialHeld, 0, true, horizon, releaseAfter, horizon, &end);
-        bool nowUsed = (buf.orbUsedTick >= 0);
+        bool nowUsed = false;
+        int now = tryAt(0, &nowUsed);
         if (nowUsed && now >= horizon) {
             return 0;
         }
 
         int from = nowUsed ? 1 : std::max(1, touch - 1);
-        int to = std::min(maxDelay, std::max(leave, touch + st(5)));
+        int to = std::min(maxDelay, std::max(leave, touch + st(6)));
         int safeStart = -1, safeEnd = -1;
         int bestRet = -1, bestK = 0, bestAt = -1;
+        double orbBudget = Buffer::budgetMs * 1.6;
 
         for (int k = from; k <= to; ++k) {
-            if (clickOverTime()) break;
-            int ret = simulate(layer, p1, p2, dual, initialHeld, k, true, horizon, releaseAfter, horizon, &end);
-            bool used = (buf.orbUsedTick >= 0);
+            if (clickMs() > orbBudget) break;
+            bool used = false;
+            int ret = tryAt(k, &used);
             if (end == SimEnd::StopSearch) break;
             if (!used) {
                 if (safeStart >= 0) break;
@@ -1129,12 +2128,33 @@ namespace {
         }
 
         if (safeStart >= 0) {
+            int mid = (safeStart + safeEnd) / 2;
+            int chosen = mid;
+            for (int off = 0; off <= safeEnd - safeStart; ++off) {
+                int k = (off % 2 == 0) ? (mid + off / 2) : (mid - (off + 1) / 2);
+                if (k < safeStart || k > safeEnd) continue;
+                if (clickOverTime() || robustAt(k)) {
+                    chosen = k;
+                    break;
+                }
+            }
             *landed = horizon;
-            return (safeStart + safeEnd) / 2;
+            return chosen;
         }
-        if (bestK > 0 && bestAt >= std::max(now, 0) + st(12)) {
+
+        int nowNext = (nowUsed && now >= 0) ? nextClickAt(layer, p1, p2, dual, initialHeld, 0, true, horizon, releaseAfter, now) : -1;
+        if (nowNext >= 0) {
+            return 0;
+        }
+        if (bestK > 0 && bestAt >= std::max(now, 0) + st(nowUsed ? 28 : 12)) {
             *landed = bestRet;
             return bestK;
+        }
+        if (bestK > 0 && bestAt > std::max(now, 0) && !clickOverTime()) {
+            if (nextClickAt(layer, p1, p2, dual, initialHeld, bestK, true, horizon, releaseAfter, bestRet) >= 0) {
+                *landed = bestRet;
+                return bestK;
+            }
         }
         return 0;
     }
@@ -1142,15 +2162,15 @@ namespace {
     int waveScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, bool down, int horizon, int target, SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, down, horizon, -1, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch || clickOverTime()) {
+        if (ret >= target || *end == SimEnd::StopSearch || quickScore || clickOverTime()) {
             return ret;
         }
-        if (delay > 0 && (ret <= currentBaseSurvival + st(4) || ret < st(14))) {
-            return ret;
-        }
-        int turnAt = ret - st(6);
-        if (turnAt >= st(6)) {
-            int length = std::min(horizon, turnAt + st(14));
+        bool mini = (p1->m_isDart && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
+        int minTurn = st(mini ? 3 : 5);
+        for (int margin : { 4, 8, 12 }) {
+            int turnAt = ret - st(margin);
+            if (turnAt < minTurn || clickOverTime()) break;
+            int length = std::min(horizon, turnAt + st(16));
             SimEnd turnEnd;
             int turned = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, down, length, turnAt, length, &turnEnd, true);
             if (turned >= length) {
@@ -1160,21 +2180,31 @@ namespace {
         return ret;
     }
 
-    constexpr int ROBOT_HOLDS[] = { 8, 22, 40 };
+    constexpr int ROBOT_HOLDS[] = { 3, 7, 12, 18, 26, 36, 48, 64 };
+    int robotUsedHold = -1;
 
     int robotScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, int horizon, int target, SimEnd* end) {
         int usual = robotHold.pick(st(20), 50);
         int best = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, horizon, usual, target, end);
-        if (best >= target || *end == SimEnd::StopSearch || clickOverTime()) {
+        robotUsedHold = usual;
+        if (best >= target || *end == SimEnd::StopSearch || quickScore || clickOverTime()) {
             return best;
         }
-        for (int hold : ROBOT_HOLDS) {
+        int holds[std::size(ROBOT_HOLDS)];
+        std::copy(std::begin(ROBOT_HOLDS), std::end(ROBOT_HOLDS), holds);
+        std::stable_sort(std::begin(holds), std::end(holds), [&](int a, int b) {
+            return std::abs(st(a) - usual) < std::abs(st(b) - usual);
+        });
+        for (int hold : holds) {
+            if (std::abs(st(hold) - usual) < st(3)) continue;
             if (clickOverTime()) break;
-            if (std::abs(st(hold) - usual) < st(4)) continue;
             SimEnd e;
             int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, horizon, st(hold), target, &e, true);
-            if (ret > best) best = ret;
+            if (ret > best) {
+                best = ret;
+                robotUsedHold = st(hold);
+            }
             if (best >= target) break;
         }
         return best;
@@ -1183,22 +2213,18 @@ namespace {
     int spiderScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, int horizon, int releaseAfter, int target, SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, horizon, releaseAfter, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch || clickOverTime()) {
+        if (ret >= target || *end == SimEnd::StopSearch || quickScore || clickOverTime()) {
             return ret;
         }
-        if (delay > 0 && (ret <= currentBaseSurvival + st(4) || ret < st(12))) {
-            return ret;
-        }
-        int at = ret - st(6);
-        if (at >= st(4)) {
-            int length = std::min(horizon, at + st(14));
+        for (int margin : { 4, 8, 12 }) {
+            int at = ret - st(margin);
+            if (at < st(4) || clickOverTime()) break;
+            int length = std::min(horizon, at + st(16));
             buf.retapAt = at;
             SimEnd e;
             int retapped = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, length, releaseAfter, length, &e, true);
             buf.retapAt = -1;
-            if (retapped >= length) {
-                return horizon;
-            }
+            if (retapped >= length) return horizon;
         }
         return ret;
     }
@@ -1206,20 +2232,16 @@ namespace {
     int shipScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, bool down, int horizon, int target, SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, down, horizon, -1, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch || clickOverTime()) {
+        if (ret >= target || *end == SimEnd::StopSearch || quickScore || clickOverTime()) {
             return ret;
         }
-        if (delay > 0 && (ret <= currentBaseSurvival + st(4) || ret < st(14))) {
-            return ret;
-        }
-        int turnAt = ret - st(10);
-        if (turnAt >= st(6)) {
-            int length = std::min(horizon, turnAt + st(14));
+        for (int margin : { 6, 12, 20 }) {
+            int turnAt = ret - st(margin);
+            if (turnAt < st(4) || clickOverTime()) break;
+            int length = std::min(horizon, turnAt + st(16));
             SimEnd turnEnd;
             int turned = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, down, length, turnAt, length, &turnEnd, true);
-            if (turned >= length) {
-                return horizon;
-            }
+            if (turned >= length) return horizon;
         }
         return ret;
     }
@@ -1227,27 +2249,30 @@ namespace {
     int ufoScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
         int delay, int horizon, int releaseAfter, int target, SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, horizon, releaseAfter, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch || clickOverTime()) {
+        if (ret >= target || *end == SimEnd::StopSearch || quickScore || clickOverTime()) {
             return ret;
         }
-        if (delay > 0 && (ret <= currentBaseSurvival + st(4) || ret < st(12))) {
-            return ret;
-        }
-        int at = ret - st(8);
-        if (at >= st(4)) {
-            int length = std::min(horizon, at + st(16));
+        for (int margin : { 4, 10, 16 }) {
+            int at = ret - st(margin);
+            if (at < st(4) || clickOverTime()) break;
+            int length = std::min(horizon, at + st(20));
             buf.retapAt = at;
             SimEnd e;
             int reflapped = simulateOrbs(layer, p1, p2, dual, initialHeld, delay, true, length, releaseAfter, length, &e, true);
             buf.retapAt = -1;
-            if (reflapped >= length) {
-                return horizon;
-            }
+            if (reflapped >= length) return horizon;
         }
         return ret;
     }
 
-    constexpr int SAME_CRASH_TRIES = 3;
+    // -------------------------------------------------------------------------
+    // Search Strategies (Smallest + Wave Margin + Two-Pass + No-Hitch Resume)
+    // -------------------------------------------------------------------------
+    constexpr int SAME_CRASH_TRIES = 4;
+    int searchFrom = 1;
+    int budgetCutK = 0;
+    bool resumeNow = false;
+    QueuedInput resumeEntry {};
 
     bool sameCrash(int k, int ret, int base, int& streak) {
         if (streak >= 0 && std::abs(k + ret - base) <= 1) {
@@ -1258,52 +2283,79 @@ namespace {
         return streak >= SAME_CRASH_TRIES;
     }
 
-    // Unified fast stride-2 + 1-tick refinement search
-    int searchFast(int horizon, int maxDelay, int base, bool needFull,
-        std::function<int(int, int, SimEnd*)> const& score) {
+    int searchSmallest(int horizon, int maxDelay, int base, int* landed,
+        std::function<int(int, int, SimEnd*)> const& score, double budget, bool needFull) {
+        budget = std::min(budget, searchBudget());
+        auto start = std::chrono::steady_clock::now();
         int target = needFull ? horizon : std::min(horizon, base + st(12));
+        budgetCutK = 0;
         int streak = 0;
-        int prevTested = 0;
 
-        for (int k = 1; k <= maxDelay;) {
-            if (clickOverTime()) return 0;
+        for (int k = searchFrom; k <= maxDelay; ++k) {
             SimEnd end;
             int ret = score(k, target, &end);
             if (end == SimEnd::StopSearch) return 0;
             if (ret >= target) {
-                int bestK = k;
-                if (k - prevTested > 1 && !clickOverTime()) {
-                    SimEnd prevEnd;
-                    if (score(k - 1, target, &prevEnd) >= target) {
-                        bestK = k - 1;
-                    }
-                }
-                // 1-tick safety margin check if time permits
-                if (bestK + 1 <= maxDelay && !clickOverTime()) {
-                    SimEnd nextEnd;
-                    if (score(bestK + 1, target, &nextEnd) >= target) {
-                        return bestK + 1;
-                    }
-                }
-                return bestK;
+                *landed = ret;
+                return k;
             }
             if (sameCrash(k, ret, base, streak)) return 0;
-            prevTested = k;
-            int step = (k >= 3 && maxDelay >= 8) ? 2 : 1;
-            if (k < maxDelay && k + step > maxDelay) {
-                k = maxDelay;
-            } else {
-                k += step;
+            if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budget) {
+                budgetCutK = k;
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    int searchTwoPass(int horizon, int maxDelay, int base, int* landed,
+        std::function<int(int, int, SimEnd*)> const& score, bool needFull) {
+        quickScore = true;
+        int k = searchSmallest(horizon, maxDelay, base, landed, score, searchBudget() * 0.5, needFull);
+        quickScore = false;
+        if (k > 0) return k;
+        double left = Buffer::budgetMs - clickMs();
+        if (left < 0.35) {
+            return 0;
+        }
+        return searchSmallest(horizon, maxDelay, base, landed, score, left, needFull);
+    }
+
+    int searchWave(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool initialHeld,
+        bool down, int horizon, int maxDelay, int base, int* landed) {
+        auto start = std::chrono::steady_clock::now();
+        double budget = searchBudget();
+        int target = std::min(horizon, base + st(12));
+        budgetCutK = 0;
+
+        for (int k = searchFrom; k <= maxDelay; ++k) {
+            SimEnd end;
+            int ret = waveScore(layer, p1, p2, dual, initialHeld, k, down, horizon, target, &end);
+            if (end == SimEnd::StopSearch) return 0;
+            if (ret >= target) {
+                *landed = ret;
+                if (Buffer::waveMargin && k + 2 <= maxDelay && !clickOverTime()) {
+                    SimEnd e1, e2;
+                    if (waveScore(layer, p1, p2, dual, initialHeld, k + 1, down, horizon, target, &e1) >= target &&
+                        waveScore(layer, p1, p2, dual, initialHeld, k + 2, down, horizon, target, &e2) >= target) {
+                        return k + 1;
+                    }
+                }
+                return k;
+            }
+            if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budget) {
+                budgetCutK = k;
+                return 0;
             }
         }
         return 0;
     }
 
     // -------------------------------------------------------------------------
-    // Input Interception & Queue Delivery (Full 1P, Dual, and 2-Player Support)
+    // Input Interception & Queue Delivery (1P, Dual, 2P, Spam Assist, Releases)
     // -------------------------------------------------------------------------
     bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
-        clickStart = std::chrono::steady_clock::now();
+        ClickTimer timer;
         auto* layer = GameManager::get()->m_playLayer;
         if (!layer || layer->m_isPlatformer) {
             return false;
@@ -1311,7 +2363,20 @@ namespace {
 
         int chIdx = isPlayer1 ? 0 : 1;
         auto& ch = buf.chan[chIdx];
-        ch.realInput = down;
+
+        bool resuming = resumeNow;
+        searchFrom = resuming ? std::max(1, resumeEntry.from) : 1;
+        budgetCutK = 0;
+        struct SearchFromReset {
+            ~SearchFromReset() { searchFrom = 1; }
+        } searchFromReset;
+
+        if (!resuming) {
+            ch.realInput = down;
+            for (auto& q : ch.queue) {
+                q.resume = false;
+            }
+        }
 
         bool twoPlayer = layer->m_level && layer->m_level->m_twoPlayerMode;
         bool inDual = layer->m_gameState.m_isDualMode && layer->m_player2 != nullptr;
@@ -1345,12 +2410,12 @@ namespace {
             return false;
         }
 
-        if (ch.queue.empty() && down == ch.appliedInput && (!down || ch.releaseShift == 0)) {
+        if (!resuming && ch.queue.empty() && down == ch.appliedInput && (!down || ch.releaseShift == 0)) {
             return false;
         }
 
         float midTick = 0.f;
-        if (Buffer::cbfSync && buf.inRealUpdate && std::abs(buf.tickDeltaCoord[pIdx]) > 0.01f) {
+        if (Buffer::cbfSync && buf.inRealUpdate && std::abs(buf.tickDeltaCoord[pIdx]) > 0.01f && !resuming) {
             midTick = std::clamp((travelCoord(p1) - buf.tickStartCoord[pIdx]) / buf.tickDeltaCoord[pIdx], 0.f, 0.999f);
         }
         buf.firstStep = 1.f - midTick;
@@ -1359,7 +2424,7 @@ namespace {
         } firstStepReset;
         int early = midTick > 0.f ? 1 : 0;
 
-        if (down && ch.queue.empty()) {
+        if (down && ch.queue.empty() && !resuming) {
             ch.releaseShift = 0;
         }
 
@@ -1369,105 +2434,144 @@ namespace {
         bool mini = (p1Wave && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
 
         int spamGap = st(anyShip && !anyWave ? Buffer::shipSpamGap : Buffer::spamGap);
-        if (ch.sinceInput < spamGap) {
-            ++ch.rapid;
-        } else {
-            ch.rapid = 0;
+        if (!resuming) {
+            if (ch.sinceInput < spamGap) {
+                ++ch.rapid;
+            } else {
+                ch.rapid = 0;
+            }
+            ch.sinceInput = 0;
         }
-        ch.sinceInput = 0;
 
         bool anyUfo = p1->m_isBird || (p2 && p2->m_isBird);
         bool anyBall = p1->m_isBall || (p2 && p2->m_isBall);
         bool anySwing = p1->m_isSwing || (p2 && p2->m_isSwing);
+        bool spamActive = (anyWave || anyShip || anyUfo || anyBall || anySwing) && ch.rapid >= SPAM_STREAK;
 
-        if ((anyWave || anyShip || anyUfo || anyBall || anySwing) && ch.rapid >= SPAM_STREAK) {
-            if (!ch.queue.empty()) {
-                for (size_t i = 0; i < ch.queue.size(); ++i) {
-                    ch.queue[i].ticksLeft = static_cast<int>(i);
-                }
-                if (ch.queue.back().down != down) {
-                    ch.queue.push_back({ static_cast<int>(ch.queue.size()), down });
-                }
-                ch.shift = 0;
-                return true;
+        // If inputs are already queued during rapid spam, drain cleanly at 1-tick spacing without dropping turns
+        if (spamActive && !ch.queue.empty() && !resuming) {
+            for (size_t i = 0; i < ch.queue.size(); ++i) {
+                ch.queue[i].ticksLeft = static_cast<int>(i);
+                ch.queue[i].resume = false;
             }
-            ch.appliedInput = down;
-            return false;
+            if (ch.queue.back().down != down) {
+                ch.queue.push_back({ static_cast<int>(ch.queue.size()), down });
+            }
+            ch.shift = 0;
+            return true;
         }
 
-        if (!ch.queue.empty()) {
+        if (!ch.queue.empty() && !resuming) {
             int after = ch.queue.back().ticksLeft;
             int minNext = (ch.queue.back().down != down) ? (after + 1) : after;
             ch.queue.push_back({ std::max(ch.shift - early, minNext), down });
             return true;
         }
 
-        if (!p1Wave) {
-            bool robot = p1->m_isRobot;
-            bool wave2 = false;
-            if (p2 && !robot) {
-                wave2 = p2->m_isDart;
-                if (!wave2) robot = p2->m_isRobot;
+        bool anyRobot = p1->m_isRobot || (p2 && p2->m_isRobot);
+        bool dashing = p1->m_isDashing || (p2 && p2->m_isDashing);
+        bool grounded = p1->m_isOnGround && (!p2 || p2->m_isOnGround);
+
+        // Standalone release handling for Cube/Ball/UFO/Spider/Swing:
+        // If releaseShift > 0, preserve tap duration; otherwise, if airborne & about to land on a staircase/pad,
+        // check whether releasing early loses a required buffered jump!
+        bool checkStaircaseRelease = false;
+        if (!anyWave && !anyShip && !anyRobot && !dashing && !down) {
+            if (ch.releaseShift > 0) {
+                ch.shift = ch.releaseShift;
+                ch.releaseShift = 0;
+                ch.queue.push_back({ std::max(0, ch.shift - early), false });
+                return true;
             }
-            bool dashing = p1->m_isDashing || (p2 && p2->m_isDashing);
-            if (!wave2 && !down && !robot && !dashing && !anyShip) {
-                if (ch.releaseShift > 0) {
-                    ch.shift = ch.releaseShift;
-                    ch.releaseShift = 0;
-                    ch.queue.push_back({ std::max(0, ch.shift - early), false });
-                    return true;
-                }
+            if (!grounded && !spamActive) {
+                checkStaircaseRelease = true;
+            } else {
                 ch.appliedInput = false;
                 return false;
             }
         }
 
         bool anyFlyer = isFlying(p1) || (p2 && isFlying(p2));
-        int horizon = st(anyFlyer ? 44 : Buffer::groundHorizon);
+        int horizon = st(anyFlyer ? 48 : Buffer::groundHorizon);
         if (anyWave) {
             horizon = fullWaveHorizon(mini);
         }
 
         int rawMax = anyWave ? buf.ticksWave.load(std::memory_order_relaxed)
-                             : (anyShip ? Buffer::shipMaxDelay : buf.ticksAll.load(std::memory_order_relaxed));
+                             : buf.ticksAll.load(std::memory_order_relaxed);
         int maxDelay = st(rawMax);
+
+        // Active Fast Spam Assist: keep micro-corner protection (up to 3 ticks) instead of shutting off!
+        if (spamActive) {
+            horizon = st(20);
+            maxDelay = std::min(maxDelay, st(3));
+        }
+        if (resuming) {
+            maxDelay -= resumeEntry.elapsed;
+            if (maxDelay < searchFrom) maxDelay = 0;
+        }
         if (maxDelay <= 0) {
             ch.appliedInput = down;
             return false;
         }
 
-        bool anyRobot = p1->m_isRobot || (p2 && p2->m_isRobot);
         int releaseAfter = -1;
         if (down && !anyWave && !anyShip) {
             releaseAfter = anyRobot ? robotHold.pick(-1, 50) : holdEstimate();
         }
 
-        bool grounded = p1->m_isOnGround && (!p2 || p2->m_isOnGround);
         bool initialHeld = ch.appliedInput;
-
         SimEnd end;
-        bool cubeStyleWave = anyWave;
-        bool robotPress = down && anyRobot && !anyWave;
-        bool anySpider = p1->m_isSpider || (p2 && p2->m_isSpider);
-        bool spiderPress = down && anySpider && !anyWave && !robotPress;
-        bool ufoPress = down && (anyUfo || anySwing) && !anyWave && !anyShip;
-        bool shipInput = anyShip && !anyWave;
-        bool groundPress = down && !anyFlyer && !anyRobot && !anySpider && !anyWave;
 
-        // Mid-air orb alignment for non-flying modes
-        if (down && !grounded && !anyWave && !anyShip && !ufoPress && Buffer::orbAlign) {
+        // 1. Mid-air Orb Alignment before running base jump/fall
+        if (down && !grounded && !anyWave && !anyShip && !spamActive && Buffer::orbAlign && !resuming) {
             int orbLanded = 0;
             int k = alignOrb(layer, p1, p2, simDual, initialHeld, horizon, releaseAfter, maxDelay, &orbLanded);
             if (k > 0) {
                 ch.shift = k;
                 ch.queue.push_back({ std::max(0, k - early), down });
-                notifyExternalSave(k, true, down);
+                notifyExternalSave(k, TagOrb, down);
                 return true;
             }
         }
 
-        // Run base (delay = 0)
-        currentBaseSurvival = 0;
+        // 2. Staircase / Auto-Buffer Release Protection for non-Wave/Robot/Ship modes
+        if (checkStaircaseRelease) {
+            int releaseNow = simulateOrbs(layer, p1, p2, simDual, true, 0, false, horizon, -1, horizon, &end, true);
+            if (releaseNow >= horizon) {
+                ch.appliedInput = false;
+                return false;
+            }
+            // Only delay the release if holding a few ticks longer actually touches ground/pad/orb and survives!
+            int cap = std::min(maxDelay, st(8));
+            for (int k = 1; k <= cap && !clickOverTime(); ++k) {
+                SimEnd e;
+                int holdMore = simulateOrbs(layer, p1, p2, simDual, true, k, false, horizon, -1, horizon, &e, true);
+                if (e == SimEnd::StopSearch) break;
+                if (holdMore >= horizon) {
+                    ch.shift = k;
+                    ch.queue.push_back({ std::max(0, k - early), false });
+                    notifyExternalSave(k, TagNormal, false);
+                    return true;
+                }
+            }
+            ch.appliedInput = false;
+            return false;
+        }
+
+        bool cubeStyleWave = anyWave;
+        bool robotPress = down && anyRobot && !anyWave && Buffer::robotSmart;
+        bool robotRelease = !down && anyRobot && !anyWave && !anyShip && Buffer::robotSmart;
+        bool anySpider = p1->m_isSpider || (p2 && p2->m_isSpider);
+        bool spiderPress = down && anySpider && !anyWave && !robotPress && Buffer::spiderSmart;
+        bool ufoPress = down && (anyUfo || anySwing) && !anyWave && !anyShip;
+        bool shipInput = anyShip && !anyWave;
+        bool groundPress = down && !anyFlyer && !anyRobot && !anySpider && !anyWave;
+
+        quickScore = spamActive;
+        struct QuickReset { ~QuickReset() { quickScore = false; } } quickReset;
+
+        // 3. Base Trajectory (delay = 0)
         buf.captureBase = true;
         buf.baseTouchedDown = false;
         int base = cubeStyleWave ? waveScore(layer, p1, p2, simDual, initialHeld, 0, down, horizon, horizon, &end)
@@ -1476,21 +2580,28 @@ namespace {
                  : ufoPress      ? ufoScore(layer, p1, p2, simDual, initialHeld, 0, horizon, releaseAfter, horizon, &end)
                  : shipInput     ? shipScore(layer, p1, p2, simDual, initialHeld, 0, down, horizon, horizon, &end)
                                  : simulateOrbs(layer, p1, p2, simDual, initialHeld, 0, down, horizon, releaseAfter, horizon, &end);
+        bool baseSwitched = buf.lastRunSwitched;
         buf.captureBase = false;
-        currentBaseSurvival = base;
 
-        if (base >= horizon || clickOverTime()) {
+        if (baseSwitched && base < horizon && !cubeStyleWave && !shipInput && !spamActive && end != SimEnd::StopSearch) {
+            if (nextClickAt(layer, p1, p2, simDual, initialHeld, 0, down, horizon, releaseAfter, base) >= 0) {
+                base = horizon;
+            }
+        }
+
+        if (base >= horizon) {
             ch.appliedInput = down;
             return false;
         }
 
-        if (down && (grounded || ufoPress) && !anyWave && !anyShip && Buffer::orbAlign && !clickOverTime()) {
+        // Ground-to-Orb Rescue: if jumping off the ground right now dies, check if holding the click for an orb right ahead saves you!
+        if (down && grounded && !anyWave && !anyShip && !spamActive && Buffer::orbAlign && !resuming && !clickOverTime()) {
             int orbLanded = 0;
             int k = alignOrb(layer, p1, p2, simDual, initialHeld, horizon, releaseAfter, maxDelay, &orbLanded);
             if (k > 0) {
                 ch.shift = k;
                 ch.queue.push_back({ std::max(0, k - early), down });
-                notifyExternalSave(k, true, down);
+                notifyExternalSave(k, TagOrb, down);
                 return true;
             }
         }
@@ -1509,24 +2620,90 @@ namespace {
                                  : simulateOrbs(layer, p1, p2, simDual, initialHeld, k, down, horizon, releaseAfter, target, e);
         };
 
-        bool needFull = (groundPress || robotPress || ufoPress);
-        int saved = searchFast(horizon, maxDelay, base, needFull, scoreAt);
+        bool needFull = (groundPress || robotPress || robotRelease || ufoPress);
+        int landed = 0;
+        int saved = 0;
+
+        if (spamActive) {
+            saved = searchSmallest(horizon, maxDelay, base, &landed, scoreAt, searchBudget(), false);
+        } else if (cubeStyleWave) {
+            saved = searchWave(layer, p1, p2, simDual, initialHeld, down, horizon, maxDelay, base, &landed);
+        } else if (robotPress || spiderPress || ufoPress) {
+            saved = searchTwoPass(horizon, maxDelay, base, &landed, scoreAt, needFull);
+        } else {
+            saved = searchSmallest(horizon, maxDelay, base, &landed, scoreAt, searchBudget(), needFull);
+        }
+
+        // No-Hitch Multi-Tick Continuation: if budget ran out mid-window, pause 1 tick and continue next step
+        int resumes = resuming ? resumeEntry.resumes : 0;
+        if (saved <= 0 && Buffer::noHitch && !spamActive && budgetCutK > 0 && budgetCutK < maxDelay && resumes < MAX_RESUMES) {
+            QueuedInput next {
+                std::max(0, 1 - early), down, true,
+                budgetCutK, (resuming ? resumeEntry.elapsed : 0) + 1, resumes + 1
+            };
+            ch.shift = 1;
+            ch.queue.push_back(next);
+            return true;
+        }
 
         if (saved <= 0) {
             ch.appliedInput = down;
             return false;
         }
 
+        // Sub-Tick Robustness Verification (±0.5 tick spatial tolerance)
+        bool usedRobust = false;
+        if (Buffer::robustSaves && !spamActive && clickMs() < Buffer::budgetMs) {
+            int target = needFull ? horizon : std::min(horizon, base + st(12));
+            float shift = std::max(0.3f, 0.5f * (311.58f / 240.f) * (std::abs(p1->m_playerSpeed) / 0.9f));
+            auto isRobust = [&](int k) {
+                for (float off : { shift, -shift }) {
+                    buf.ghostShiftX = off;
+                    SimEnd e;
+                    int r = scoreAt(k, target, &e);
+                    buf.ghostShiftX = 0.f;
+                    if (r < target) return false;
+                }
+                return true;
+            };
+            if (!isRobust(saved)) {
+                for (int k = saved + 1; k <= std::min(maxDelay, saved + st(3)) && !clickOverTime(); ++k) {
+                    SimEnd e;
+                    int r = scoreAt(k, target, &e);
+                    if (r >= target && isRobust(k)) {
+                        saved = k;
+                        usedRobust = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        int totalDelay = saved + (resuming ? resumeEntry.elapsed : 0);
         ch.shift = saved;
         ch.queue.push_back({ std::max(0, saved - early), down });
-        notifyExternalSave(saved, false, down);
+        notifyExternalSave(totalDelay, spamActive ? TagSpam : (usedRobust ? TagRobust : TagNormal), down);
         return true;
+    }
+
+    void resumeClick(PlayLayer* layer, int chIdx, QueuedInput const& q) {
+        resumeNow = true;
+        resumeEntry = q;
+        bool held = intercept(layer, q.down, chIdx == 0);
+        resumeNow = false;
+        sweepGhostLayer();
+        if (!held) {
+            sendButton(layer, chIdx, q.down);
+        }
     }
 
     void deliverChannel(PlayLayer* layer, int chIdx) {
         auto& ch = buf.chan[chIdx];
         if (ch.sinceInput <= 998) {
             ++ch.sinceInput;
+        }
+        if (layer->m_player1 && layer->m_player1->m_isDead) {
+            return;
         }
         if (ch.queue.empty()) {
             if (ch.appliedInput != ch.realInput) {
@@ -1535,6 +2712,12 @@ namespace {
             return;
         }
         while (!ch.queue.empty() && ch.queue.front().ticksLeft <= 0) {
+            if (ch.queue.front().resume) {
+                auto q = ch.queue.front();
+                ch.queue.pop_front();
+                resumeClick(layer, chIdx, q);
+                continue;
+            }
             bool down = ch.queue.front().down;
             ch.queue.pop_front();
             ch.releaseShift = down ? ch.shift : 0;
@@ -1551,22 +2734,25 @@ namespace {
     }
 
     inline void deliverPending(PlayLayer* layer) {
+        updateWatched(layer);
         deliverChannel(layer, 0);
         deliverChannel(layer, 1);
     }
 }
 
 // -----------------------------------------------------------------------------
-// Mod Initialization & Hooks (Zero In-Game UI Signs, Zero Disk Saving)
+// Mod Initialization & Hooks
 // -----------------------------------------------------------------------------
 $on_mod(Loaded) {
-    buf.snapshots.reserve(32);
-    buf.simUsed.reserve(32);
-    buf.orbsUsed.reserve(16);
-    buf.simDisabled.reserve(32);
-    buf.harmless.reserve(16);
+    buf.snapshots.reserve(64);
+    buf.simUsed.reserve(64);
+    buf.orbsUsed.reserve(32);
+    buf.simDisabled.reserve(64);
+    buf.simEnabled.reserve(64);
+    buf.harmless.reserve(32);
+    buf.levelMarks.reserve(64);
 
-    setStageByIndex(1); // Starts on 4 Ticks
+    setStageByIndex(1); // Starts on 4 Ticks (1.0 Frame @ 60Hz)
     spawnExternalWindow();
 }
 
@@ -1587,6 +2773,10 @@ class $modify(BufPlayLayer, PlayLayer) {
         if (!player || wasDead || !player->m_isDead) {
             return;
         }
+        if (buf.owner == this) {
+            if (buf.chan[0].appliedInput) sendButton(this, 0, false);
+            if (buf.chan[1].appliedInput) sendButton(this, 1, false);
+        }
         buf.chan[0].fullReset();
         buf.chan[1].fullReset();
     }
@@ -1601,6 +2791,8 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.ghostLayerBase = buf.ghostLayer->getChildrenCount();
         buf.chan[0].fullReset();
         buf.chan[1].fullReset();
+        buf.owner = this;
+        ensureLevelIndexed(this);
         return true;
     }
 
@@ -1610,9 +2802,21 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     void resetLevel() {
-        buf.chan[0].fullReset();
-        buf.chan[1].fullReset();
+        if (buf.owner != this) {
+            PlayLayer::resetLevel();
+            return;
+        }
+        if (buf.chan[0].appliedInput && !buf.chan[0].realInput) sendButton(this, 0, false);
+        if (buf.chan[1].appliedInput && !buf.chan[1].realInput) sendButton(this, 1, false);
+        buf.chan[0].resetPending();
+        buf.chan[1].resetPending();
+        buf.chan[0].pressTick = -1;
+        buf.chan[1].pressTick = -1;
+        firedMoves.clear();
+        pendingSpawns.clear();
+        scriptedCache = {};
         PlayLayer::resetLevel();
+        syncHeld(this);
     }
 
     void playEndAnimationToPos(CCPoint position) {
@@ -1652,12 +2856,20 @@ class $modify(BufEffectGameObject, EffectGameObject) {
 
     void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
         if (buf.simulating) return;
+        if ((m_objectID == 901 || m_objectID == 1346) && Buffer::predictTriggers && m_duration > 0.f && firedMoves.size() < 256) {
+            firedMoves[this] = tickCount;
+        }
         EffectGameObject::triggerObject(layer, uniqueID, remapKeys);
     }
 
     void playTriggerEffect() {
         if (buf.simulating) return;
         EffectGameObject::playTriggerEffect();
+    }
+
+    void animationTriggered() {
+        if (buf.simulating) return;
+        EffectGameObject::animationTriggered();
     }
 };
 
@@ -1866,8 +3078,8 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         }
         static gd::vector<GameObject*> relevant;
         relevant.clear();
-        if (static_cast<int>(relevant.capacity()) < objectCount) {
-            relevant.reserve(objectCount);
+        if (static_cast<int>(relevant.capacity()) < objectCount + 32) {
+            relevant.reserve(objectCount + 32);
         }
 
         constexpr uint64_t keep = COLLIDING_TYPES | INTERACT_TYPES;
@@ -1875,6 +3087,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         double const gx = gPos.x;
         double const gy = gPos.y;
         bool const isSpider = player->m_isSpider;
+        bool const isSideways = player->m_isSideways;
         bool haveRect = false;
         CCRect ghostRect;
         auto& list = *objects;
@@ -1887,10 +3100,10 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
             if (object->m_scaleX == 1.f && object->m_scaleY == 1.f &&
                 object->m_width <= 45.f && object->m_height <= 45.f) {
-                if (std::abs(object->m_positionX - gx) > 70.0) {
+                if (!isSideways && std::abs(object->m_positionX - gx) > 75.0) {
                     continue;
                 }
-                if (!isSpider && std::abs(object->m_positionY - gy) > 70.0) {
+                if (!isSpider && !isSideways && std::abs(object->m_positionY - gy) > 75.0) {
                     continue;
                 }
             }
@@ -1939,9 +3152,13 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                         buf.harmless.push_back(object);
                         continue;
                     }
-                    if (Buffer::portalPredict && (MODE_TYPES & bit)) {
-                        setGhostMode(player, object->m_objectType);
+                    if (Buffer::portalPredict && isGhost(player) &&
+                        (((MODE_TYPES & bit) && setGhostMode(player, object->m_objectType)) ||
+                         ghostTeleport(player, object) ||
+                         ghostSoloPortal(object) ||
+                         ghostDualPortal(player, object))) {
                         buf.harmless.push_back(object);
+                        haveRect = false; // Refresh rect if teleported or rescaled
                         continue;
                     }
                     buf.ghostHitPortal = true;
@@ -1949,14 +3166,38 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                     bool mini = object->m_objectType == GameObjectType::MiniSizePortal;
                     if ((player->m_vehicleSize < 1.f) != mini) {
                         player->togglePlayerScale(mini, true);
+                        haveRect = false;
                     }
                 } else {
                     player->m_playerSpeed = speed;
                 }
             }
         }
+
+        // Wake up group-disabled objects that a predicted Toggle Trigger or Toggle Orb turned ON
+        static std::vector<GameObject*> woke;
+        woke.clear();
+        if (!buf.simEnabled.empty() && player) {
+            for (auto* object : buf.simEnabled) {
+                auto type = static_cast<unsigned>(object->m_objectType);
+                uint64_t bit = type < 64 ? (1ull << type) : 0;
+                if (!(keep & bit) || vecContains(buf.simDisabled, object) ||
+                    std::abs(object->m_positionX - gx) > 200.0 || std::abs(object->m_positionY - gy) > 200.0) {
+                    continue;
+                }
+                if (object->m_isGroupDisabled) {
+                    object->m_isGroupDisabled = false;
+                    woke.push_back(object);
+                }
+                relevant.push_back(object);
+            }
+        }
+
         if (!relevant.empty()) {
             GJBaseGameLayer::collisionCheckObjects(player, &relevant, static_cast<int>(relevant.size()), dt);
+        }
+        for (auto* object : woke) {
+            object->m_isGroupDisabled = true;
         }
     }
 
@@ -1982,17 +3223,25 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                 buf.firstOrbTick = buf.simTick;
             }
             buf.lastOrbTick = buf.simTick;
+            if (buf.orbUsedTick >= 0 && !isOrbUsedByGhost(ring, player)) {
+                buf.laterOrbTouched = true;
+            }
         }
         GJBaseGameLayer::playerTouchedRing(player, ring);
 
         bool autoOrb = buf.orbClick || (buf.orbAfterFirst && buf.orbUsedTick >= 0 && !isOrbUsedByGhost(ring, player));
         if (buf.simulating && autoOrb && !isOrbUsedByGhost(ring, player)) {
-            bool first = player == buf.ghost1;
+            bool first = (player == buf.ghost1);
             bool& held = first ? buf.held1 : buf.held2;
             bool& autoClick = first ? buf.auto1 : buf.auto2;
+            int& autoAt = first ? buf.autoAt1 : buf.autoAt2;
             int& autoHold = first ? buf.autoHold1 : buf.autoHold2;
 
-            if (!autoClick) {
+            if (buf.orbClickDelay > 0) {
+                if (!held && autoAt == -1) {
+                    autoAt = buf.simTick + buf.orbClickDelay;
+                }
+            } else if (!autoClick) {
                 if (held && buf.simTick > buf.currentDelay && !player->m_isDashing) {
                     player->releaseButton(PlayerButton::Jump);
                 }
@@ -2022,14 +3271,8 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     void toggleGroupTriggered(int group, bool activate, gd::vector<int> const& remapKeys, int triggerID, int controlID) {
         if (buf.simulating) {
-            if (!activate) {
-                if (auto* objects = this->getGroup(group)) {
-                    for (auto* object : CCArrayExt<GameObject*>(objects)) {
-                        if (!vecContains(buf.simDisabled, object)) {
-                            buf.simDisabled.push_back(object);
-                        }
-                    }
-                }
+            if (auto* objects = this->getGroup(group)) {
+                simToggle(objects, activate);
             }
             return;
         }
@@ -2038,6 +3281,10 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     void spawnGroup(int group, bool ordered, double delay, gd::vector<int> const& remapKeys, int triggerID, int controlID) {
         if (buf.simulating) return;
+        if (Buffer::predictTriggers && delay > 0.0 && !ordered && remapKeys.empty() && group > 0 && pendingSpawns.size() < 64) {
+            float tickLength = (buf.tickLength > 0.001f && buf.tickLength < 2.f) ? buf.tickLength : TICK;
+            pendingSpawns.push_back({ group, tickCount + static_cast<int>(std::lround(delay * 60.0 / tickLength)) });
+        }
         GJBaseGameLayer::spawnGroup(group, ordered, delay, remapKeys, triggerID, controlID);
     }
 
