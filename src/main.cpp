@@ -1,6 +1,6 @@
-// Click Before Frames — Ultra-Low-Overhead External Window Master Edition
+// Click Before Frames — Ultra-Low-Overhead External Window Master Edition (Lag-Fix Edition)
 // Zero in-game visual/audio footprint. Zero disk I/O. Zero per-click heap allocations.
-// < 2 us/tick idle overhead | <= 0.85 ms/click cap + no-hitch continuation | GD 2.2081 (Geode v5.11.2)
+// < 2 us/tick idle overhead | <= 0.85 ms/click cap + anti-cascade continuation | GD 2.2081 (Geode v5.11.2)
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
@@ -41,7 +41,7 @@ namespace {
     constexpr float TICK = 0.25f;
     constexpr int SPIDER_LAND = 10;
     constexpr int SPAM_STREAK = 3;
-    constexpr int MAX_RESUMES = 4;
+    constexpr int MAX_RESUMES = 1; // Capped at 1 to prevent multi-substep frame cascades
 
     constexpr int ALLOWED_TICKS[5] = { 2, 4, 8, 16, 32 };
     constexpr int STAGE_COUNT = 5;
@@ -414,21 +414,23 @@ namespace {
     // Timing, Rate Scaling & Basic Ghost Helpers
     // -------------------------------------------------------------------------
     std::chrono::steady_clock::time_point clickStart;
-    bool clickTimed = false;
+    std::chrono::steady_clock::time_point lastResumeTime {};
+    int clickTimerDepth = 0;
     int tickCount = 0;
 
     struct ClickTimer {
         ClickTimer() {
-            clickStart = std::chrono::steady_clock::now();
-            clickTimed = true;
+            if (++clickTimerDepth == 1) {
+                clickStart = std::chrono::steady_clock::now();
+            }
         }
         ~ClickTimer() {
-            clickTimed = false;
+            --clickTimerDepth;
         }
     };
 
     inline double clickMs() {
-        return clickTimed
+        return clickTimerDepth > 0
             ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count()
             : 0.0;
     }
@@ -438,7 +440,7 @@ namespace {
     }
 
     inline double searchBudget() {
-        return clickTimed ? std::max(Buffer::budgetMs - clickMs(), Buffer::budgetMs * 0.45) : Buffer::budgetMs;
+        return clickTimerDepth > 0 ? std::max(Buffer::budgetMs - clickMs(), Buffer::budgetMs * 0.45) : Buffer::budgetMs;
     }
 
     float stepScale() {
@@ -479,6 +481,11 @@ namespace {
     // -------------------------------------------------------------------------
     // L1-Cache Contiguous Mover Radar & Zero-Alloc Trigger Engine
     // -------------------------------------------------------------------------
+    struct IndexedCollider {
+        GameObject* object = nullptr;
+        double startX = 0.0; // Immutable key so moving objects never break std::lower_bound
+    };
+
     struct WatchedEntry {
         GameObject* object = nullptr;
         double x = 0.0, y = 0.0;
@@ -537,7 +544,6 @@ namespace {
         CCArray* group = nullptr;
     };
 
-    // Zero heap allocations: fixed inline move index array instead of std::vector<int>
     struct ScriptedObject {
         GameObject* object = nullptr;
         double x = 0.0, y = 0.0;
@@ -557,15 +563,15 @@ namespace {
     };
 
     constexpr size_t ACTIVE_WATCH_CAP = 96;
-    constexpr int SCRIPTED_TRIGGER_LIMIT = 48;
-    constexpr int SCRIPTED_OBJECT_LIMIT = 144;
+    constexpr int SCRIPTED_TRIGGER_LIMIT = 40;
+    constexpr int SCRIPTED_OBJECT_LIMIT = 128;
 
     std::vector<WatchedEntry> watched;
     std::vector<Mover> movers;
-    std::vector<GameObject*> levelColliders;
+    std::vector<IndexedCollider> levelColliders;
     std::vector<LevelTrigger> levelTriggers;
     GJBaseGameLayer* indexedLayer = nullptr;
-    unsigned indexedObjCount = 0;
+    bool levelIsIndexed = false;
 
     std::unordered_map<EffectGameObject*, int> firedMoves;
     std::vector<PendingSpawn> pendingSpawns;
@@ -579,12 +585,29 @@ namespace {
         levelColliders.clear();
         levelTriggers.clear();
         indexedLayer = nullptr;
-        indexedObjCount = 0;
+        levelIsIndexed = false;
         firedMoves.clear();
         pendingSpawns.clear();
         scriptedMoves.clear();
         scriptedObjects.clear();
         clickWorldDepth = 0;
+    }
+
+    void pruneExpiredTriggers() {
+        if (!firedMoves.empty()) {
+            float tl = (buf.tickLength > 0.001f && buf.tickLength < 2.f) ? buf.tickLength : TICK;
+            for (auto it = firedMoves.begin(); it != firedMoves.end();) {
+                int elapsed = tickCount - it->second;
+                if (elapsed < 0 || elapsed * tl > it->first->m_duration * 60.f + 1.f) {
+                    it = firedMoves.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        if (!pendingSpawns.empty()) {
+            std::erase_if(pendingSpawns, [](PendingSpawn const& p) { return p.at < tickCount; });
+        }
     }
 
     bool plainTrigger(EffectGameObject* t, bool rotate) {
@@ -605,15 +628,17 @@ namespace {
         return static_cast<int>(std::lround(std::max(0.f, static_cast<SpawnTriggerGameObject*>(t)->m_spawnDelay) * 60.0 / tickLength));
     }
 
+    // Indexes ONCE per PlayLayer::init instead of re-sorting on mid-level object count changes
     void ensureLevelIndexed(GJBaseGameLayer* layer) {
+        if (layer == indexedLayer && levelIsIndexed) return;
         unsigned count = layer->m_objects ? layer->m_objects->count() : 0;
-        if (layer == indexedLayer && count == indexedObjCount) return;
+        if (count == 0) return;
+
         indexedLayer = layer;
-        indexedObjCount = count;
+        levelIsIndexed = true;
         levelColliders.clear();
         levelTriggers.clear();
         watched.clear();
-        if (!layer->m_objects) return;
 
         constexpr uint64_t trackMask = COLLIDING_TYPES | INTERACT_TYPES;
         levelColliders.reserve(std::min<unsigned>(count, 4096));
@@ -639,16 +664,21 @@ namespace {
                 auto type = static_cast<unsigned>(object->m_objectType);
                 uint64_t bit = type < 64 ? (1ull << type) : 0;
                 if (trackMask & bit) {
-                    levelColliders.push_back(object);
+                    levelColliders.push_back({ object, object->m_positionX });
                 }
             }
         }
         std::sort(levelTriggers.begin(), levelTriggers.end(), [](auto const& a, auto const& b) { return a.x < b.x; });
-        std::sort(levelColliders.begin(), levelColliders.end(), [](GameObject* a, GameObject* b) { return a->m_positionX < b->m_positionX; });
+        std::sort(levelColliders.begin(), levelColliders.end(), [](IndexedCollider const& a, IndexedCollider const& b) {
+            return a.startX < b.startX;
+        });
     }
 
     // ~1.5 microseconds/tick: scans <= 96 contiguous structs in L1 cache; refreshes window every 8 ticks
     void updateWatched(GJBaseGameLayer* layer) {
+        if ((tickCount & 15) == 0) {
+            pruneExpiredTriggers();
+        }
         if (!Buffer::predictMovers || !layer || !layer->m_player1) return;
         ensureLevelIndexed(layer);
         if (levelColliders.empty()) return;
@@ -663,15 +693,22 @@ namespace {
 
             std::erase_if(watched, [&](WatchedEntry const& e) {
                 return !e.object || e.object->m_isDisabled ||
-                       e.object->m_positionX < minX - 80.0 || e.object->m_positionX > maxX + 80.0;
+                       e.object->m_positionX < minX - 120.0 || e.object->m_positionX > maxX + 120.0;
             });
 
-            auto lo = std::lower_bound(levelColliders.begin(), levelColliders.end(), minX,
-                [](GameObject* o, double x) { return o->m_positionX < x; });
+            // Search immutable startX with +/-220 unit padding for objects that moved into range
+            double searchMinX = minX - 220.0;
+            double searchMaxX = maxX + 220.0;
+            auto lo = std::lower_bound(levelColliders.begin(), levelColliders.end(), searchMinX,
+                [](IndexedCollider const& c, double x) { return c.startX < x; });
 
-            for (auto it = lo; it != levelColliders.end() && (*it)->m_positionX <= maxX && watched.size() < ACTIVE_WATCH_CAP; ++it) {
-                auto* obj = *it;
-                if (obj->m_isDisabled || std::abs(obj->m_positionY - py) > 420.0) continue;
+            int scanned = 0;
+            for (auto it = lo; it != levelColliders.end() && it->startX <= searchMaxX && watched.size() < ACTIVE_WATCH_CAP; ++it) {
+                if (++scanned > 450) break;
+                auto* obj = it->object;
+                if (obj->m_isDisabled || obj->m_positionX < minX || obj->m_positionX > maxX || std::abs(obj->m_positionY - py) > 420.0) {
+                    continue;
+                }
                 bool exists = false;
                 for (auto const& w : watched) {
                     if (w.object == obj) { exists = true; break; }
@@ -932,9 +969,9 @@ namespace {
     void simToggle(CCArray* group, bool on) {
         int seen = 0;
         for (auto* object : CCArrayExt<GameObject*>(group)) {
-            if (!object || ++seen > 1200) break;
+            if (!object || ++seen > 400) break;
             if (!on) {
-                if (!vecContains(buf.simDisabled, object)) {
+                if (buf.simDisabled.size() < 256 && !vecContains(buf.simDisabled, object)) {
                     buf.simDisabled.push_back(object);
                 }
                 continue;
@@ -946,7 +983,7 @@ namespace {
         }
     }
 
-    // Runs ONCE per click (not inside every simulate() trial!)
+    // Runs ONCE per click with strict work caps so spawn trees cannot cause lag spikes
     void collectScriptedOnce(GJBaseGameLayer* layer, PlayerObject* refPlayer, int maxTotalTicks) {
         scriptedMoves.clear();
         scriptedObjects.clear();
@@ -963,6 +1000,9 @@ namespace {
         double pathMinX = goingLeft ? (px - reach - 80.0) : (px - 80.0);
         double pathMaxX = goingLeft ? (px + 80.0) : (px + reach + 80.0);
         double pathMinY = py - 420.0, pathMaxY = py + 420.0;
+
+        int totalGroupInspected = 0;
+        int totalChainVisited = 0;
 
         auto nearPath = [&](GameObject* object, ScriptedMove const& m) {
             if (m.lockPlayerX || m.lockPlayerY) return true;
@@ -992,8 +1032,11 @@ namespace {
         };
 
         auto addMove = [&](EffectGameObject* t, double x, TriggerKind kind, bool armed, int when, bool touch, CCRect const& tr) {
+            if (static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT ||
+                totalGroupInspected > 1800 || clickMs() > Buffer::budgetMs * 0.35) {
+                return;
+            }
             int elapsed = (armed && when < 0) ? -when : -1;
-            if (static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT) return;
             auto* group = layer->getGroup(t->m_targetGroupID);
             if (!group || group->count() == 0) return;
 
@@ -1025,7 +1068,7 @@ namespace {
             bool any = false;
             int groupSeen = 0;
             for (auto* object : CCArrayExt<GameObject*>(group)) {
-                if (!object || ++groupSeen > 500) break;
+                if (!object || ++groupSeen > 180 || ++totalGroupInspected > 1800) break;
                 if (object == t || object->m_isDecoration || object->m_objectType == GameObjectType::Decoration || !nearPath(object, m)) {
                     continue;
                 }
@@ -1061,11 +1104,17 @@ namespace {
 
         std::function<void(int, double, bool, int, int, bool, CCRect const&)> spawnChain =
             [&](int groupID, double x, bool armed, int when, int depth, bool touch, CCRect const& tr) {
+            if (depth > 3 || totalChainVisited > 320 || totalGroupInspected > 1800 ||
+                static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT ||
+                clickMs() > Buffer::budgetMs * 0.35) {
+                return;
+            }
             auto* group = layer->getGroup(groupID);
-            if (!group || depth > 4) return;
+            if (!group) return;
             int seen = 0;
             for (auto* object : CCArrayExt<GameObject*>(group)) {
-                if (!object || ++seen > 400) break;
+                if (!object || ++seen > 100 || ++totalChainVisited > 320) break;
+                if (static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT) break;
                 int id = object->m_objectID;
                 if (id != 901 && id != 1346 && id != 1049 && id != 1268) continue;
                 auto* c = static_cast<EffectGameObject*>(object);
@@ -1094,6 +1143,10 @@ namespace {
         auto it = std::lower_bound(levelTriggers.begin(), levelTriggers.end(), trigMinX,
             [](auto const& m, double x) { return m.x < x; });
         for (; it != levelTriggers.end() && it->x <= trigMaxX; ++it) {
+            if (static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT ||
+                totalGroupInspected > 1800 || clickMs() > Buffer::budgetMs * 0.35) {
+                break;
+            }
             if (it->trigger->m_activated) continue;
             if (it->kind == TriggerKind::Spawn) {
                 spawnChain(it->trigger->m_targetGroupID, it->x, false, spawnSteps(it->trigger, tickLength), 0, it->touchTriggered, it->touchRect);
@@ -2304,7 +2357,6 @@ namespace {
             if (end == SimEnd::StopSearch) return 0;
             if (ret >= target) {
                 int bestK = k;
-                // Refine k - 1 if stride-2 jumped over an earlier working tick
                 if (k - prevTested > 1 && !clickOverTime()) {
                     SimEnd prevEnd;
                     int prevRet = score(k - 1, target, &prevEnd);
@@ -2626,7 +2678,10 @@ namespace {
         }
 
         int resumes = resuming ? resumeEntry.resumes : 0;
-        if (saved <= 0 && Buffer::noHitch && !spamActive && budgetCutK > 0 && budgetCutK <= maxDelay && resumes < MAX_RESUMES) {
+        auto now = std::chrono::steady_clock::now();
+        bool canResume = std::chrono::duration<double, std::milli>(now - lastResumeTime).count() >= 4.0;
+
+        if (saved <= 0 && Buffer::noHitch && !spamActive && canResume && budgetCutK > 0 && budgetCutK <= maxDelay && resumes < MAX_RESUMES) {
             QueuedInput next {
                 std::max(0, 1 - early), down, true,
                 budgetCutK, (resuming ? resumeEntry.elapsed : 0) + 1, resumes + 1
@@ -2676,6 +2731,13 @@ namespace {
     }
 
     void resumeClick(PlayLayer* layer, int chIdx, QueuedInput const& q) {
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double, std::milli>(now - lastResumeTime).count() < 4.0) {
+            sendButton(layer, chIdx, q.down);
+            return;
+        }
+        lastResumeTime = now;
+        ClickTimer resumeTimer;
         resumeNow = true;
         resumeEntry = q;
         bool held = intercept(layer, q.down, chIdx == 0);
@@ -2848,8 +2910,13 @@ class $modify(BufEffectGameObject, EffectGameObject) {
 
     void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
         if (buf.simulating) return;
-        if ((m_objectID == 901 || m_objectID == 1346) && Buffer::predictTriggers && m_duration > 0.f && firedMoves.size() < 256) {
-            firedMoves[this] = tickCount;
+        if ((m_objectID == 901 || m_objectID == 1346) && Buffer::predictTriggers && m_duration > 0.f) {
+            if (firedMoves.size() >= 64) {
+                pruneExpiredTriggers();
+            }
+            if (firedMoves.size() < 96) {
+                firedMoves[this] = tickCount;
+            }
         }
         EffectGameObject::triggerObject(layer, uniqueID, remapKeys);
     }
@@ -3253,9 +3320,14 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     void spawnGroup(int group, bool ordered, double delay, gd::vector<int> const& remapKeys, int triggerID, int controlID) {
         if (buf.simulating) return;
-        if (Buffer::predictTriggers && delay > 0.0 && !ordered && remapKeys.empty() && group > 0 && pendingSpawns.size() < 64) {
-            float tickLength = (buf.tickLength > 0.001f && buf.tickLength < 2.f) ? buf.tickLength : TICK;
-            pendingSpawns.push_back({ group, tickCount + static_cast<int>(std::lround(delay * 60.0 / tickLength)) });
+        if (Buffer::predictTriggers && delay > 0.0 && !ordered && remapKeys.empty() && group > 0) {
+            if (pendingSpawns.size() >= 48) {
+                pruneExpiredTriggers();
+            }
+            if (pendingSpawns.size() < 64) {
+                float tickLength = (buf.tickLength > 0.001f && buf.tickLength < 2.f) ? buf.tickLength : TICK;
+                pendingSpawns.push_back({ group, tickCount + static_cast<int>(std::lround(delay * 60.0 / tickLength)) });
+            }
         }
         GJBaseGameLayer::spawnGroup(group, ordered, delay, remapKeys, triggerID, controlID);
     }
