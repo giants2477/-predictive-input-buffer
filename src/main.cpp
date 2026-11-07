@@ -1,6 +1,6 @@
 // Click Before Frames — Ultra-Low-Overhead External Window Master Edition (Zero-Spike Edition)
-// Zero in-game visual/audio footprint. Zero disk I/O. Zero per-click heap allocations.
-// < 1 us/tick idle overhead | Strict <= 0.75 ms/click cap | GD 2.2081 (Geode v5.11.2)
+// Zero in-game visual/audio footprint. Zero disk I/O. Near-zero per-click heap allocations.
+// < 1 us/tick idle overhead | 0.75 ms/click soft cap, 1.5 ms hard cap | GD 2.2081 (Geode v5.11.2)
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
@@ -287,7 +287,7 @@ namespace {
                     SendMessageA(g_radioBtns[i], BM_SETCHECK, (i == currentIdx) ? BST_CHECKED : BST_UNCHECKED, 0);
                 }
 
-                g_statusLabel = CreateWindowExA(0, "STATIC", "Active: 4 Ticks (F6 / 6 to cycle)",
+                g_statusLabel = CreateWindowExA(0, "STATIC", "Active: 4 Ticks (F6 to cycle)",
                     WS_CHILD | WS_VISIBLE, 16, 190, 260, 20, hwnd, nullptr, nullptr, nullptr);
                 SendMessageA(g_statusLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
                 return 0;
@@ -307,7 +307,7 @@ namespace {
                     }
                 }
                 if (g_statusLabel) {
-                    auto txt = fmt::format("Active: {} Ticks (F6 / 6 to cycle)", ALLOWED_TICKS[idx]);
+                    auto txt = fmt::format("Active: {} Ticks (F6 to cycle)", ALLOWED_TICKS[idx]);
                     SetWindowTextA(g_statusLabel, txt.c_str());
                 }
                 return 0;
@@ -328,7 +328,7 @@ namespace {
             wc.lpfnWndProc = ExtWndProc;
             wc.hInstance = hInst;
             wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-            wc.hbrBackground = (HBRUSH)(COLOR_WINDOW);
+            wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
             wc.lpszClassName = "CBFExternalMasterWnd";
             RegisterClassExA(&wc);
 
@@ -538,13 +538,14 @@ namespace {
         int at = 0;
     };
 
-    constexpr size_t ACTIVE_WATCH_CAP = 36;
-    constexpr int SCRIPTED_TRIGGER_LIMIT = 18;
-    constexpr int SCRIPTED_OBJECT_LIMIT = 48;
+    constexpr size_t ACTIVE_WATCH_CAP = 64;
+    constexpr int SCRIPTED_TRIGGER_LIMIT = 32;
+    constexpr int SCRIPTED_OBJECT_LIMIT = 96;
 
     std::vector<WatchedEntry> watched;
     std::vector<Mover> movers;
     std::vector<IndexedCollider> levelColliders;
+    std::vector<IndexedCollider> dynamicColliders;
     std::vector<LevelTrigger> levelTriggers;
     GJBaseGameLayer* indexedLayer = nullptr;
     bool levelIsIndexed = false;
@@ -560,6 +561,7 @@ namespace {
         watched.clear();
         movers.clear();
         levelColliders.clear();
+        dynamicColliders.clear();
         levelTriggers.clear();
         indexedLayer = nullptr;
         levelIsIndexed = false;
@@ -610,17 +612,22 @@ namespace {
         indexedLayer = layer;
         levelIsIndexed = true;
         levelColliders.clear();
+        dynamicColliders.clear();
         levelTriggers.clear();
         watched.clear();
 
         constexpr uint64_t trackMask = COLLIDING_TYPES | INTERACT_TYPES;
         levelColliders.reserve(std::min<unsigned>(count / 2 + 64, 16384));
+        std::vector<int> moveGroups;
 
         for (auto* object : CCArrayExt<GameObject*>(layer->m_objects)) {
             if (!object) continue;
             int id = object->m_objectID;
             if (id == 901 || id == 1346 || id == 1049 || id == 1268) {
                 auto* t = static_cast<EffectGameObject*>(object);
+                if ((id == 901 || id == 1346) && t->m_targetGroupID > 0) {
+                    moveGroups.push_back(t->m_targetGroupID);
+                }
                 if (!t->m_isSpawnTriggered) {
                     bool touch = t->m_isTouchTriggered;
                     CCRect tr = touch ? t->getObjectRect() : CCRect {};
@@ -645,6 +652,25 @@ namespace {
         std::sort(levelColliders.begin(), levelColliders.end(), [](IndexedCollider const& a, IndexedCollider const& b) {
             return a.startX < b.startX;
         });
+        std::sort(moveGroups.begin(), moveGroups.end());
+        moveGroups.erase(std::unique(moveGroups.begin(), moveGroups.end()), moveGroups.end());
+        for (int gid : moveGroups) {
+            auto* group = layer->getGroup(gid);
+            if (!group) continue;
+            for (auto* object : CCArrayExt<GameObject*>(group)) {
+                if (!object || object->m_isDecoration || object->m_objectType == GameObjectType::Decoration) continue;
+                auto type = static_cast<unsigned>(object->m_objectType);
+                uint64_t bit = type < 64 ? (1ull << type) : 0;
+                if (!(trackMask & bit)) continue;
+                if (dynamicColliders.size() >= 2048) break;
+                dynamicColliders.push_back({ object, 0.0 });
+            }
+        }
+        std::sort(dynamicColliders.begin(), dynamicColliders.end(), [](IndexedCollider const& a, IndexedCollider const& b) {
+            return a.object < b.object;
+        });
+        dynamicColliders.erase(std::unique(dynamicColliders.begin(), dynamicColliders.end(),
+            [](IndexedCollider const& a, IndexedCollider const& b) { return a.object == b.object; }), dynamicColliders.end());
     }
 
     void updateWatched(GJBaseGameLayer* layer) {
@@ -680,6 +706,21 @@ namespace {
                 if (++scanned > 220) break;
                 auto* obj = it->object;
                 if (obj->m_isDisabled || obj->m_positionX < minX || obj->m_positionX > maxX || std::abs(obj->m_positionY - py) > 260.0) {
+                    continue;
+                }
+                bool exists = false;
+                for (auto const& w : watched) {
+                    if (w.object == obj) { exists = true; break; }
+                }
+                if (!exists) {
+                    watched.push_back({ obj, obj->m_positionX, obj->m_positionY, 0.0, 0.0, 0.0, 0.0, obj->getRotationX(), 0.0, -200 });
+                }
+            }
+            for (auto const& dc : dynamicColliders) {
+                if (watched.size() >= ACTIVE_WATCH_CAP) break;
+                auto* obj = dc.object;
+                if (!obj || obj->m_isDisabled || obj->m_positionX < minX || obj->m_positionX > maxX ||
+                    std::abs(obj->m_positionY - py) > 260.0) {
                     continue;
                 }
                 bool exists = false;
@@ -1060,8 +1101,7 @@ namespace {
             }
         }
 
-        std::function<void(int, double, bool, int, int, bool, CCRect const&)> spawnChain =
-            [&](int groupID, double x, bool armed, int when, int depth, bool touch, CCRect const& tr) {
+        auto spawnChain = [&](auto&& self, int groupID, double x, bool armed, int when, int depth, bool touch, CCRect const& tr) -> void {
             if (depth > 2 || totalChainVisited > 140 || totalGroupInspected > 700 ||
                 static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT ||
                 clickMs() > Buffer::budgetMs * 0.22) {
@@ -1079,7 +1119,7 @@ namespace {
                 if (!c->m_isSpawnTriggered) continue;
                 if (id == 1268) {
                     if (plainSpawn(c)) {
-                        spawnChain(c->m_targetGroupID, x, armed, when + spawnSteps(c, tickLength), depth + 1, touch, tr);
+                        self(self, c->m_targetGroupID, x, armed, when + spawnSteps(c, tickLength), depth + 1, touch, tr);
                     }
                 } else if (id == 1049) {
                     if (c->m_targetGroupID > 0) addMove(c, x, TriggerKind::Toggle, armed, when, touch, tr);
@@ -1092,7 +1132,7 @@ namespace {
         if (!pendingSpawns.empty()) {
             for (auto const& p : pendingSpawns) {
                 if (p.at >= tickCount) {
-                    spawnChain(p.group, 0.0, true, p.at - tickCount, 0, false, {});
+                    spawnChain(spawnChain, p.group, 0.0, true, p.at - tickCount, 0, false, {});
                 }
             }
         }
@@ -1108,7 +1148,7 @@ namespace {
             }
             if (it->trigger->m_activated) continue;
             if (it->kind == TriggerKind::Spawn) {
-                spawnChain(it->trigger->m_targetGroupID, it->x, false, spawnSteps(it->trigger, tickLength), 0, it->touchTriggered, it->touchRect);
+                spawnChain(spawnChain, it->trigger->m_targetGroupID, it->x, false, spawnSteps(it->trigger, tickLength), 0, it->touchTriggered, it->touchRect);
             } else {
                 addMove(it->trigger, it->x, it->kind, false, 0, it->touchTriggered, it->touchRect);
             }
@@ -1927,6 +1967,9 @@ namespace {
             if (delay > 0 && ((tick - delay) & 15) == 15 && clickOverTime()) {
                 break;
             }
+            if ((tick & 31) == 31 && clickMs() >= Buffer::budgetMs * 2.0) {
+                break;
+            }
 
             second = buf.simSecond;
             if (!second) landed2 = true;
@@ -2361,8 +2404,18 @@ namespace {
         return streak >= SAME_CRASH_TRIES;
     }
 
+    struct ScoreFn {
+        void* ctx;
+        int (*call)(void*, int, int, SimEnd*);
+        template <typename F>
+        ScoreFn(F& f)
+            : ctx(const_cast<void*>(static_cast<const void*>(&f))),
+              call([](void* c, int k, int t, SimEnd* e) -> int { return (*static_cast<F*>(c))(k, t, e); }) {}
+        int operator()(int k, int t, SimEnd* e) const { return call(ctx, k, t, e); }
+    };
+
     int searchFast(int horizon, int maxDelay, int base, int* landed,
-        std::function<int(int, int, SimEnd*)> const& score, double budget, bool needFull, bool applyMargin = false) {
+        ScoreFn const& score, double budget, bool needFull, bool applyMargin = false) {
         budget = std::min(budget, searchBudget());
         if (budget <= 0.02) return 0;
 
@@ -2412,7 +2465,7 @@ namespace {
     }
 
     int searchTwoPass(int horizon, int maxDelay, int base, int* landed,
-        std::function<int(int, int, SimEnd*)> const& score, bool needFull, bool applyMargin = false) {
+        ScoreFn const& score, bool needFull, bool applyMargin = false) {
         quickScore = true;
         int k = searchFast(horizon, maxDelay, base, landed, score, searchBudget() * 0.65, needFull, applyMargin);
         quickScore = false;
@@ -2854,6 +2907,8 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.chan[1].resetPending();
         buf.chan[0].pressTick = -1;
         buf.chan[1].pressTick = -1;
+        buf.chan[0].rapid = buf.chan[1].rapid = 0;
+        buf.chan[0].sinceInput = buf.chan[1].sinceInput = 999;
         firedMoves.clear();
         pendingSpawns.clear();
         watched.clear();
@@ -3080,7 +3135,7 @@ class $modify(BufPlayerObject, PlayerObject) {
 class $modify(BufKeyboard, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
         if (isKeyDown && !isKeyRepeat) {
-            if (key == KEY_F6 || key == KEY_Six) {
+            if (key == KEY_F6) {
                 cycleStage();
             }
         }
@@ -3220,6 +3275,35 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             }
         }
 
+        if (!movers.empty() || !scriptedObjects.empty()) {
+            auto inject = [&](GameObject* object) {
+                if (!object || object->m_isDisabled || object->m_isGroupDisabled || object->m_isDecoration) return;
+                auto type = static_cast<unsigned>(object->m_objectType);
+                uint64_t bit = type < 64 ? (1ull << type) : 0;
+                if (!(keep & bit)) return;
+                double reach = 130.0 + std::max(object->m_width, object->m_height);
+                if (!isSideways && std::abs(object->m_positionX - gx) > reach) return;
+                if (!isSpider && !isSideways && std::abs(object->m_positionY - gy) > reach) return;
+                if (!buf.simDisabled.empty() && vecContains(buf.simDisabled, object)) return;
+                if (buf.haveRealRect && (bit & HAZARD_TYPES)) {
+                    if (!buf.harmless.empty() && vecContains(buf.harmless, object)) return;
+                    if (buf.simTick <= 1) {
+                        auto const& r = object->getObjectRect();
+                        if (r.intersectsRect(buf.realRect1) || r.intersectsRect(buf.realRect2)) {
+                            buf.harmless.push_back(object);
+                            return;
+                        }
+                    }
+                }
+                if (std::find(relevant.begin(), relevant.end(), object) == relevant.end()) {
+                    relevant.push_back(object);
+                }
+            };
+            for (auto const& m : movers) inject(m.object);
+            for (auto const& o : scriptedObjects) {
+                if (!o.mover) inject(o.object);
+            }
+        }
         static std::vector<GameObject*> woke;
         woke.clear();
         if (!buf.simEnabled.empty() && player) {
