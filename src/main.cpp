@@ -530,7 +530,7 @@ namespace {
         bool rotated = false;
         uint8_t moveCount = 0;
         uint8_t moves[8] = {};
-        double lastX = 0.0, lastY = 0.0, lastSpin = 0.0;
+        double lastX = -1e30, lastY = -1e30, lastSpin = -1e30;
     };
 
     struct PendingSpawn {
@@ -556,6 +556,7 @@ namespace {
     std::vector<ScriptedObject> scriptedObjects;
     int clickWorldDepth = 0;
     int lastPruneTick = -1;
+    size_t dynScanCursor = 0;
 
     void forgetLevelIndex() {
         watched.clear();
@@ -571,6 +572,7 @@ namespace {
         scriptedObjects.clear();
         clickWorldDepth = 0;
         lastPruneTick = -1;
+        dynScanCursor = 0;
     }
 
     void pruneExpiredTriggers() {
@@ -615,6 +617,7 @@ namespace {
         dynamicColliders.clear();
         levelTriggers.clear();
         watched.clear();
+        dynScanCursor = 0;
 
         constexpr uint64_t trackMask = COLLIDING_TYPES | INTERACT_TYPES;
         levelColliders.reserve(std::min<unsigned>(count / 2 + 64, 16384));
@@ -663,7 +666,7 @@ namespace {
                 uint64_t bit = type < 64 ? (1ull << type) : 0;
                 if (!(trackMask & bit)) continue;
                 if (dynamicColliders.size() >= 2048) break;
-                dynamicColliders.push_back({ object, 0.0 });
+                dynamicColliders.push_back({ object, object->m_positionX });
             }
         }
         std::sort(dynamicColliders.begin(), dynamicColliders.end(), [](IndexedCollider const& a, IndexedCollider const& b) {
@@ -716,19 +719,25 @@ namespace {
                     watched.push_back({ obj, obj->m_positionX, obj->m_positionY, 0.0, 0.0, 0.0, 0.0, obj->getRotationX(), 0.0, -200 });
                 }
             }
-            for (auto const& dc : dynamicColliders) {
-                if (watched.size() >= ACTIVE_WATCH_CAP) break;
-                auto* obj = dc.object;
-                if (!obj || obj->m_isDisabled || obj->m_positionX < minX || obj->m_positionX > maxX ||
-                    std::abs(obj->m_positionY - py) > 260.0) {
-                    continue;
-                }
-                bool exists = false;
-                for (auto const& w : watched) {
-                    if (w.object == obj) { exists = true; break; }
-                }
-                if (!exists) {
-                    watched.push_back({ obj, obj->m_positionX, obj->m_positionY, 0.0, 0.0, 0.0, 0.0, obj->getRotationX(), 0.0, -200 });
+
+            // Bounded rolling scan over dynamicColliders (max 128 checks per 16 ticks)
+            if (!dynamicColliders.empty() && watched.size() < ACTIVE_WATCH_CAP) {
+                size_t const totalDyn = dynamicColliders.size();
+                size_t const maxCheck = std::min<size_t>(totalDyn, 128);
+                for (size_t i = 0; i < maxCheck && watched.size() < ACTIVE_WATCH_CAP; ++i) {
+                    dynScanCursor = (dynScanCursor + 1) % totalDyn;
+                    auto* obj = dynamicColliders[dynScanCursor].object;
+                    if (!obj || obj->m_isDisabled || obj->m_positionX < minX || obj->m_positionX > maxX ||
+                        std::abs(obj->m_positionY - py) > 260.0) {
+                        continue;
+                    }
+                    bool exists = false;
+                    for (auto const& w : watched) {
+                        if (w.object == obj) { exists = true; break; }
+                    }
+                    if (!exists) {
+                        watched.push_back({ obj, obj->m_positionX, obj->m_positionY, 0.0, 0.0, 0.0, 0.0, obj->getRotationX(), 0.0, -200 });
+                    }
                 }
             }
         }
@@ -851,9 +860,11 @@ namespace {
 
             m.object->m_positionX = x;
             m.object->m_positionY = y;
+            m.object->setObjectRectDirty(true);
+            m.object->m_isOrientedBoxDirty = true;
             m.dirty = true;
 
-            // Only update CCNode transform and dirty OBB2D if within collision proximity of ghost
+            // Only update CCNode transform if within collision proximity of ghost
             if (std::abs(x - ghostX) <= 220.0 && std::abs(y - ghostY) <= 220.0) {
                 if (m.vrot != 0.0) {
                     double spun = m.vrot * steps;
@@ -861,8 +872,6 @@ namespace {
                     m.object->setRotationY(static_cast<float>(m.rotY + spun));
                 }
                 m.object->setPosition({ static_cast<float>(x), static_cast<float>(y) });
-                m.object->setObjectRectDirty(true);
-                m.object->m_isOrientedBoxDirty = true;
             }
         }
     }
@@ -1174,10 +1183,12 @@ namespace {
 
     inline void restoreScriptedRunPositions() {
         for (auto& o : scriptedObjects) {
-            if (o.placed && !o.mover) {
-                o.object->setPosition(o.node);
-                o.object->m_positionX = o.x;
-                o.object->m_positionY = o.y;
+            if (o.placed) {
+                if (!o.mover) {
+                    o.object->setPosition(o.node);
+                    o.object->m_positionX = o.x;
+                    o.object->m_positionY = o.y;
+                }
                 if (o.rotated) {
                     o.object->setRotationX(o.rotX);
                     o.object->setRotationY(o.rotY);
@@ -1187,6 +1198,7 @@ namespace {
                 o.object->m_isOrientedBoxDirty = true;
             }
             o.placed = false;
+            o.lastX = o.lastY = o.lastSpin = -1e30;
         }
     }
 
@@ -1285,17 +1297,17 @@ namespace {
             o.lastSpin = spin;
             o.object->m_positionX = x;
             o.object->m_positionY = y;
+            o.object->setObjectRectDirty(true);
+            o.object->m_isOrientedBoxDirty = true;
             o.placed = true;
 
             if (std::abs(x - ghostX) <= 220.0 && std::abs(y - ghostY) <= 220.0) {
                 o.object->setPosition({ static_cast<float>(x), static_cast<float>(y) });
-                if (!o.mover && (spin != 0.0 || o.rotated)) {
+                if (spin != 0.0 || o.rotated) {
                     o.object->setRotationX(static_cast<float>(o.rotX + spin));
                     o.object->setRotationY(static_cast<float>(o.rotY + spin));
                     o.rotated = true;
                 }
-                o.object->setObjectRectDirty(true);
-                o.object->m_isOrientedBoxDirty = true;
             }
         }
     }
@@ -1391,6 +1403,8 @@ namespace {
         ghost->retain();
         ghost->setPosition(CCPoint(0.f, 105.f));
         ghost->setVisible(false);
+        if (ghost->m_waveTrail) ghost->m_waveTrail->setVisible(false);
+        if (ghost->m_regularTrail) ghost->m_regularTrail->setVisible(false);
         buf.ghostLayer->addChild(ghost);
         return ghost;
     }
@@ -2912,6 +2926,19 @@ class $modify(BufPlayLayer, PlayLayer) {
         firedMoves.clear();
         pendingSpawns.clear();
         watched.clear();
+        movers.clear();
+        dynScanCursor = 0;
+
+        if (buf.ghost1) {
+            buf.ghost1->stopAllActions();
+            buf.ghost1->stopParticles();
+        }
+        if (buf.ghost2) {
+            buf.ghost2->stopAllActions();
+            buf.ghost2->stopParticles();
+        }
+        sweepGhostLayer();
+
         PlayLayer::resetLevel();
         syncHeld(this);
     }
@@ -2941,7 +2968,11 @@ class $modify(BufHardStreak, HardStreak) {
     }
 
     void addPoint(CCPoint point) {
-        if (buf.simulating) return;
+        if (buf.simulating ||
+            (buf.ghost1 && this == buf.ghost1->m_waveTrail) ||
+            (buf.ghost2 && this == buf.ghost2->m_waveTrail)) {
+            return;
+        }
         HardStreak::addPoint(point);
     }
 };
@@ -3152,6 +3183,18 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         (void)self.setHookPriority("GJBaseGameLayer::flipGravity", HOOK_PRIORITY);
         (void)self.setHookPriority("GJBaseGameLayer::gameEventTriggered", HOOK_PRIORITY);
         (void)self.setHookPriority("GJBaseGameLayer::playerWillSwitchMode", HOOK_PRIORITY);
+        (void)self.setHookPriority("GJBaseGameLayer::claimParticle", HOOK_PRIORITY);
+        (void)self.setHookPriority("GJBaseGameLayer::spawnParticle", HOOK_PRIORITY);
+    }
+
+    void claimParticle(gd::string key, int tag, cocos2d::CCParticleSystemQuad* particle, int zOrder, cocos2d::tCCPositionType posType) {
+        if (buf.simulating) return;
+        GJBaseGameLayer::claimParticle(key, tag, particle, zOrder, posType);
+    }
+
+    cocos2d::CCParticleSystemQuad* spawnParticle(char const* plist, int tag, cocos2d::tCCPositionType posType, cocos2d::CCPoint pos) {
+        if (buf.simulating) return nullptr;
+        return GJBaseGameLayer::spawnParticle(plist, tag, posType, pos);
     }
 
     bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
@@ -3286,7 +3329,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                 if (!isSpider && !isSideways && std::abs(object->m_positionY - gy) > reach) return;
                 if (!buf.simDisabled.empty() && vecContains(buf.simDisabled, object)) return;
                 if (buf.haveRealRect && (bit & HAZARD_TYPES)) {
-                    if (!buf.harmless.empty() && vecContains(buf.harmless, object)) return;
+                    if (!buf.harmless.empty() && vecContains(buf.harmless, object)) continue;
                     if (buf.simTick <= 1) {
                         auto const& r = object->getObjectRect();
                         if (r.intersectsRect(buf.realRect1) || r.intersectsRect(buf.realRect2)) {
