@@ -3222,9 +3222,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         (void)self.setHookPriority("GJBaseGameLayer::spawnParticle", HOOK_PRIORITY);
     }
 
-    void claimParticle(gd::string key, int tag, cocos2d::CCParticleSystemQuad* particle, int zOrder, cocos2d::tCCPositionType posType) {
-        if (buf.simulating) return;
-        GJBaseGameLayer::claimParticle(key, tag, particle, zOrder, posType);
+    cocos2d::CCParticleSystemQuad* claimParticle(gd::string key, int zLayer) {
+        if (buf.simulating) return nullptr;
+        return GJBaseGameLayer::claimParticle(key, zLayer);
     }
 
     cocos2d::CCParticleSystemQuad* spawnParticle(char const* plist, int tag, cocos2d::tCCPositionType posType, cocos2d::CCPoint pos) {
@@ -3384,7 +3384,6 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         woke.clear();
         if (!buf.simEnabled.empty() && player) {
             for (auto* object : buf.simEnabled) {
-                if (!object || !vecContains(buf.simDisabled, object) == false) {}
                 if (!object || vecContains(buf.simDisabled, object)) continue;
                 if (std::abs(object->m_positionX - gx) > 160.0 || std::abs(object->m_positionY - gy) > 160.0) {
                     continue;
