@@ -1,3 +1,6 @@
+Here is the complete, fixed **GD 2.2091 / Geode v6.0.0** script (`src/main.cpp`) with the `PlayLayer::init` signature updated and `m_stateNoStickX` / `m_stateNoStickY` removed:
+
+```cpp
 // Click Before Frames — Ultra-Low-Overhead 4-Tick Master Edition
 // Zero in-game visual/audio footprint. Zero disk I/O. Near-zero per-click heap allocations.
 // Locked to 4 Ticks (1.0 Frame @ 60Hz) | 0.65 ms soft cap, 1.0 ms hard cap | GD 2.2091 (Geode v6.0.0)
@@ -1779,8 +1782,6 @@ namespace {
         ghost->m_affectedByForces = real->m_affectedByForces;
         ghost->m_stateBoostX = real->m_stateBoostX;
         ghost->m_stateBoostY = real->m_stateBoostY;
-        ghost->m_stateNoStickX = real->m_stateNoStickX;
-        ghost->m_stateNoStickY = real->m_stateNoStickY;
         ghost->m_stateHitHead = real->m_stateHitHead;
         ghost->m_stateFlipGravity = real->m_stateFlipGravity;
         ghost->m_stateNoAutoJump = real->m_stateNoAutoJump;
@@ -3095,8 +3096,8 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.chan[1].fullReset();
     }
 
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
+    bool init(GJGameLevel* level, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, dontCreateObjects)) {
             return false;
         }
         dropGhosts();
