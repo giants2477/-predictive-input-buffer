@@ -1,6 +1,6 @@
 // Click Before Frames — Ultra-Low-Overhead 4-Tick Master Edition
 // Zero in-game visual/audio footprint. Zero disk I/O. Near-zero per-click heap allocations.
-// Locked to 4 Ticks (1.0 Frame @ 60Hz) | 0.65 ms soft cap, 1.0 ms hard cap | GD 2.2081 (Geode v5.11.2)
+// Locked to 4 Ticks (1.0 Frame @ 60Hz) | 0.65 ms soft cap, 1.0 ms hard cap | GD 2.2091 (Geode v6.0.0)
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
@@ -3187,7 +3187,7 @@ class $modify(BufEffectGameObject, EffectGameObject) {
         (void)self.setHookPriority("EffectGameObject::triggerObject", HOOK_PRIORITY);
     }
 
-    void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
+    void triggerObject(GJBaseGameLayer* layer, int uniqueID, std::vector<int> const* remapKeys) {
         if (buf.simulating) return;
         if (m_objectID == 1616 && Buffer::predictTriggers && m_targetGroupID > 0) {
             int gid = m_targetGroupID;
@@ -3392,7 +3392,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         (void)self.setHookPriority("GJBaseGameLayer::spawnParticle", HOOK_PRIORITY);
     }
 
-    cocos2d::CCParticleSystemQuad* claimParticle(gd::string key, int zLayer) {
+    cocos2d::CCParticleSystemQuad* claimParticle(std::string key, int zLayer) {
         if (buf.simulating) return nullptr;
         return GJBaseGameLayer::claimParticle(key, zLayer);
     }
@@ -3429,12 +3429,12 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
     }
 
-    void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects, int objectCount, float dt) {
+    void collisionCheckObjects(PlayerObject* player, std::vector<GameObject*>* objects, int objectCount, float dt) {
         if (!buf.simulating) {
             GJBaseGameLayer::collisionCheckObjects(player, objects, objectCount, dt);
             return;
         }
-        static gd::vector<GameObject*> relevant;
+        static std::vector<GameObject*> relevant;
         relevant.clear();
         if (static_cast<int>(relevant.capacity()) < objectCount + 32) {
             relevant.reserve(objectCount + 32);
@@ -3645,7 +3645,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         GJBaseGameLayer::gameEventTriggered(event, material, playerID);
     }
 
-    void toggleGroupTriggered(int group, bool activate, gd::vector<int> const& remapKeys, int triggerID, int controlID) {
+    void toggleGroupTriggered(int group, bool activate, std::vector<int> const& remapKeys, int triggerID, int controlID) {
         if (buf.simulating) {
             if (auto* objects = this->getGroup(group)) {
                 simToggle(objects, activate);
@@ -3655,7 +3655,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         GJBaseGameLayer::toggleGroupTriggered(group, activate, remapKeys, triggerID, controlID);
     }
 
-    void spawnGroup(int group, bool ordered, double delay, gd::vector<int> const& remapKeys, int triggerID, int controlID) {
+    void spawnGroup(int group, bool ordered, double delay, std::vector<int> const& remapKeys, int triggerID, int controlID) {
         if (buf.simulating) return;
         if (Buffer::predictTriggers && delay > 0.0 && !ordered && remapKeys.empty() && group > 0) {
             if (pendingSpawns.size() >= 48 && lastPruneTick != tickCount) {
@@ -3690,7 +3690,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         GJBaseGameLayer::activateItemEditTrigger(object);
     }
 
-    void activateItemCompareTrigger(ItemTriggerGameObject* object, gd::vector<int> const& remapKeys) {
+    void activateItemCompareTrigger(ItemTriggerGameObject* object, std::vector<int> const& remapKeys) {
         if (buf.simulating) return;
         GJBaseGameLayer::activateItemCompareTrigger(object, remapKeys);
     }
