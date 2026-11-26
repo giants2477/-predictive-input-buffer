@@ -1,6 +1,3 @@
-Here is the complete, fixed **GD 2.2091 / Geode v6.0.0** script (`src/main.cpp`) with the `PlayLayer::init` signature updated and `m_stateNoStickX` / `m_stateNoStickY` removed:
-
-```cpp
 // Click Before Frames — Ultra-Low-Overhead 4-Tick Master Edition
 // Zero in-game visual/audio footprint. Zero disk I/O. Near-zero per-click heap allocations.
 // Locked to 4 Ticks (1.0 Frame @ 60Hz) | 0.65 ms soft cap, 1.0 ms hard cap | GD 2.2091 (Geode v6.0.0)
