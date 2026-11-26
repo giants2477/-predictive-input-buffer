@@ -1,4 +1,4 @@
-// Click Before Frames — Ultra-Low-Overhead 4-Tick Fixed Edition
+// Click Before Frames — Ultra-Low-Overhead 4-Tick Master Edition
 // Zero in-game visual/audio footprint. Zero disk I/O. Near-zero per-click heap allocations.
 // Locked to 4 Ticks (1.0 Frame @ 60Hz) | 0.65 ms soft cap, 1.0 ms hard cap | GD 2.2081 (Geode v5.11.2)
 
@@ -90,6 +90,11 @@ namespace {
             case 1334: return 1.6f;
             default: return 0.f;
         }
+    }
+
+    inline bool isMoverTriggerID(int id) {
+        return id == 901 || id == 1346 || id == 1347 || id == 1814 || id == 2067 ||
+               id == 3006 || id == 3007 || id == 3008 || id == 3016 || id == 3032;
     }
 
     struct QueuedInput {
@@ -229,7 +234,6 @@ namespace {
         int orbUsedTick = -1;
         bool captureBase = false;
         bool baseTouchedDown = false;
-        bool ghostUsedParticles = false;
 
         std::vector<ObjSnapshot> snapshots;
         std::vector<std::pair<GameObject*, uint8_t>> simUsed;
@@ -408,7 +412,7 @@ namespace {
     }
 
     // -------------------------------------------------------------------------
-    // L1-Cache Contiguous Mover Radar & Zero-Alloc Trigger Engine
+    // L1-Cache Contiguous Mover Radar & Exact Eased Trigger Engine
     // -------------------------------------------------------------------------
     struct IndexedCollider {
         GameObject* object = nullptr;
@@ -435,10 +439,13 @@ namespace {
         int curStep = 0;
         double curDx = 0.0, curDy = 0.0;
         double stepVx = 0.0, stepVy = 0.0;
+        double syncRadius = 220.0;
+        bool suppressPos = false;
+        bool suppressRot = false;
         bool dirty = false;
     };
 
-    enum class TriggerKind : uint8_t { Move, Rotate, Toggle, Spawn };
+    enum class TriggerKind : uint8_t { Move, Rotate, Toggle, Spawn, Stop };
 
     struct LevelTrigger {
         EffectGameObject* trigger = nullptr;
@@ -451,10 +458,12 @@ namespace {
     struct FiredMove {
         EffectGameObject* trigger = nullptr;
         int tick = 0;
+        int targetGroupID = 0;
     };
 
     struct ScriptedMove {
         TriggerKind kind = TriggerKind::Move;
+        int targetGroupID = 0;
         bool touchTriggered = false;
         bool lockPlayerX = false, lockPlayerY = false;
         bool hasCenter = false;
@@ -463,6 +472,8 @@ namespace {
         bool initArmed = false;
         bool armed = false;
         bool toggled = false;
+        bool stopped = false;
+        bool fromFired = false;
         int initFireStep = -1;
         int fireStep = -1;
         int delay = 0;
@@ -473,6 +484,7 @@ namespace {
         double anchorPlayerX = 0.0, anchorPlayerY = 0.0;
         double angle = 0.0;
         double cx = 0.0, cy = 0.0;
+        GameObject* centerObj = nullptr;
         double steps = 0.0;
         double rate = 0.0;
         double from = 0.0;
@@ -490,11 +502,15 @@ namespace {
         double x = 0.0, y = 0.0;
         CCPoint node {};
         float rotX = 0.f, rotY = 0.f;
+        double syncRadius = 220.0;
         bool mover = false;
+        bool activeFiredMove = false;
+        bool activeFiredRotate = false;
         bool placed = false;
         bool rotated = false;
         uint8_t moveCount = 0;
-        uint8_t moves[8] = {};
+        uint8_t moves[12] = {};
+        double tempX = 0.0, tempY = 0.0;
         double lastX = -1e30, lastY = -1e30, lastSpin = -1e30;
     };
 
@@ -503,9 +519,9 @@ namespace {
         int at = 0;
     };
 
-    constexpr size_t ACTIVE_WATCH_CAP = 64;
-    constexpr int SCRIPTED_TRIGGER_LIMIT = 32;
-    constexpr int SCRIPTED_OBJECT_LIMIT = 96;
+    constexpr size_t ACTIVE_WATCH_CAP = 96;
+    constexpr int SCRIPTED_TRIGGER_LIMIT = 48;
+    constexpr int SCRIPTED_OBJECT_LIMIT = 128;
 
     std::vector<WatchedEntry> watched;
     std::vector<Mover> movers;
@@ -519,6 +535,7 @@ namespace {
     std::vector<PendingSpawn> pendingSpawns;
     std::vector<ScriptedMove> scriptedMoves;
     std::vector<ScriptedObject> scriptedObjects;
+    bool scriptedHasRotate = false;
     int clickWorldDepth = 0;
     int lastPruneTick = -1;
     size_t dynScanCursor = 0;
@@ -535,6 +552,7 @@ namespace {
         pendingSpawns.clear();
         scriptedMoves.clear();
         scriptedObjects.clear();
+        scriptedHasRotate = false;
         clickWorldDepth = 0;
         lastPruneTick = -1;
         dynScanCursor = 0;
@@ -558,8 +576,11 @@ namespace {
         if (rotate) {
             return t->m_rotationTargetID <= 0 && (t->m_rotationDegrees != 0.f || t->m_times360 != 0);
         }
-        if (t->m_useMoveTarget || t->m_lockToCameraX || t->m_lockToCameraY) return false;
-        return t->m_lockToPlayerX || t->m_lockToPlayerY || t->m_moveOffset.x != 0.f || t->m_moveOffset.y != 0.f;
+        if (t->m_useMoveTarget) {
+            return t->m_centerGroupID > 0;
+        }
+        return t->m_lockToPlayerX || t->m_lockToPlayerY || t->m_lockToCameraX || t->m_lockToCameraY ||
+               t->m_moveOffset.x != 0.f || t->m_moveOffset.y != 0.f;
     }
 
     bool plainSpawn(EffectGameObject* t) {
@@ -591,16 +612,21 @@ namespace {
         for (auto* object : CCArrayExt<GameObject*>(layer->m_objects)) {
             if (!object) continue;
             int id = object->m_objectID;
-            if (id == 901 || id == 1346 || id == 1049 || id == 1268) {
+            if (isMoverTriggerID(id)) {
                 auto* t = static_cast<EffectGameObject*>(object);
-                if ((id == 901 || id == 1346) && t->m_targetGroupID > 0) {
+                if (t->m_targetGroupID > 0) {
                     moveGroups.push_back(t->m_targetGroupID);
                 }
+            }
+            if (id == 901 || id == 1346 || id == 1049 || id == 1268 || id == 1616) {
+                auto* t = static_cast<EffectGameObject*>(object);
                 if (!t->m_isSpawnTriggered) {
                     bool touch = t->m_isTouchTriggered;
                     CCRect tr = touch ? t->getObjectRect() : CCRect {};
                     if (id == 1049 && t->m_targetGroupID > 0) {
                         levelTriggers.push_back({ t, t->m_positionX, TriggerKind::Toggle, touch, tr });
+                    } else if (id == 1616 && t->m_targetGroupID > 0) {
+                        levelTriggers.push_back({ t, t->m_positionX, TriggerKind::Stop, touch, tr });
                     } else if (id == 1268 && plainSpawn(t)) {
                         levelTriggers.push_back({ t, t->m_positionX, TriggerKind::Spawn, touch, tr });
                     } else if ((id == 901 || id == 1346) && plainTrigger(t, id == 1346)) {
@@ -630,7 +656,7 @@ namespace {
                 auto type = static_cast<unsigned>(object->m_objectType);
                 uint64_t bit = type < 64 ? (1ull << type) : 0;
                 if (!(trackMask & bit)) continue;
-                if (dynamicColliders.size() >= 2048) break;
+                if (dynamicColliders.size() >= 4096) break;
                 dynamicColliders.push_back({ object, object->m_positionX });
             }
         }
@@ -655,13 +681,13 @@ namespace {
         bool left = layer->m_player1->m_isGoingLeft;
 
         if ((tickCount & 15) == 0 || watched.empty()) {
-            double minX = left ? (px - 380.0) : (px - 80.0);
-            double maxX = left ? (px + 80.0) : (px + 380.0);
+            double minX = left ? (px - 500.0) : (px - 100.0);
+            double maxX = left ? (px + 100.0) : (px + 500.0);
 
             std::erase_if(watched, [&](WatchedEntry const& e) {
                 return !e.object || e.object->m_isDisabled ||
-                       e.object->m_positionX < minX - 90.0 || e.object->m_positionX > maxX + 90.0 ||
-                       std::abs(e.object->m_positionY - py) > 300.0;
+                       e.object->m_positionX < minX - 110.0 || e.object->m_positionX > maxX + 110.0 ||
+                       std::abs(e.object->m_positionY - py) > 340.0;
             });
 
             double searchMinX = minX - 160.0;
@@ -671,9 +697,9 @@ namespace {
 
             int scanned = 0;
             for (auto it = lo; it != levelColliders.end() && it->startX <= searchMaxX && watched.size() < ACTIVE_WATCH_CAP; ++it) {
-                if (++scanned > 220) break;
+                if (++scanned > 260) break;
                 auto* obj = it->object;
-                if (obj->m_isDisabled || obj->m_positionX < minX || obj->m_positionX > maxX || std::abs(obj->m_positionY - py) > 260.0) {
+                if (obj->m_isDisabled || obj->m_positionX < minX || obj->m_positionX > maxX || std::abs(obj->m_positionY - py) > 300.0) {
                     continue;
                 }
                 bool exists = false;
@@ -687,12 +713,12 @@ namespace {
 
             if (!dynamicColliders.empty() && watched.size() < ACTIVE_WATCH_CAP) {
                 size_t const totalDyn = dynamicColliders.size();
-                size_t const maxCheck = std::min<size_t>(totalDyn, 128);
+                size_t const maxCheck = std::min<size_t>(totalDyn, 160);
                 for (size_t i = 0; i < maxCheck && watched.size() < ACTIVE_WATCH_CAP; ++i) {
                     dynScanCursor = (dynScanCursor + 1) % totalDyn;
                     auto* obj = dynamicColliders[dynScanCursor].object;
                     if (!obj || obj->m_isDisabled || obj->m_positionX < minX || obj->m_positionX > maxX ||
-                        std::abs(obj->m_positionY - py) > 260.0) {
+                        std::abs(obj->m_positionY - py) > 300.0) {
                         continue;
                     }
                     bool exists = false;
@@ -726,6 +752,11 @@ namespace {
         }
     }
 
+    inline double objectSyncRadius(GameObject* obj) {
+        double ext = std::max(std::abs(obj->m_width * obj->m_scaleX), std::abs(obj->m_height * obj->m_scaleY));
+        return 220.0 + ext * 0.5;
+    }
+
     void collectMoversOnce() {
         movers.clear();
         if (!Buffer::predictMovers) return;
@@ -740,6 +771,7 @@ namespace {
                 m.vy = w.vy;
                 m.stepVx = w.vx;
                 m.stepVy = w.vy;
+                m.syncRadius = objectSyncRadius(object);
                 double speed = std::hypot(w.vx, w.vy);
                 double prev = std::hypot(w.pvx, w.pvy);
                 if (speed > 1e-6 && prev > 1e-6) {
@@ -775,66 +807,78 @@ namespace {
                 m.stepVy = m.vy;
                 if (!m.dirty) continue;
                 m.dirty = false;
-                if (m.vrot != 0.0) {
+                if (m.vrot != 0.0 && !m.suppressRot) {
                     m.object->setRotationX(static_cast<float>(m.rotX));
                     m.object->setRotationY(static_cast<float>(m.rotY));
                 }
-                m.object->setPosition({ static_cast<float>(m.x), static_cast<float>(m.y) });
-                m.object->m_positionX = m.x;
-                m.object->m_positionY = m.y;
+                if (!m.suppressPos) {
+                    m.object->setPosition({ static_cast<float>(m.x), static_cast<float>(m.y) });
+                    m.object->m_positionX = m.x;
+                    m.object->m_positionY = m.y;
+                }
                 m.object->setObjectRectDirty(true);
                 m.object->m_isOrientedBoxDirty = true;
                 continue;
             }
 
-            double x = m.x + m.vx * steps;
-            double y = m.y + m.vy * steps;
-            if (m.accelSteps > 0) {
-                int n = std::min(steps, m.accelSteps);
-                double grow = 0.5 * n * (n + 1);
-                x = m.x + m.vx * steps + m.ax * (grow + static_cast<double>(n) * (steps - n));
-                y = m.y + m.vy * steps + m.ay * (grow + static_cast<double>(n) * (steps - n));
-            } else if (m.turn != 0.0) {
-                if (steps == m.curStep + 1) {
-                    double nvx = m.stepVx * m.cosTurn - m.stepVy * m.sinTurn;
-                    double nvy = m.stepVx * m.sinTurn + m.stepVy * m.cosTurn;
-                    m.stepVx = nvx;
-                    m.stepVy = nvy;
-                    m.curDx += nvx;
-                    m.curDy += nvy;
-                    m.curStep = steps;
-                } else {
-                    m.curDx = 0.0;
-                    m.curDy = 0.0;
-                    m.stepVx = m.vx;
-                    m.stepVy = m.vy;
-                    for (int s = 0; s < steps; ++s) {
+            if (m.suppressPos && m.suppressRot) {
+                continue;
+            }
+
+            double x = m.x;
+            double y = m.y;
+            if (!m.suppressPos) {
+                x = m.x + m.vx * steps;
+                y = m.y + m.vy * steps;
+                if (m.accelSteps > 0) {
+                    int n = std::min(steps, m.accelSteps);
+                    double grow = 0.5 * n * (n + 1);
+                    x = m.x + m.vx * steps + m.ax * (grow + static_cast<double>(n) * (steps - n));
+                    y = m.y + m.vy * steps + m.ay * (grow + static_cast<double>(n) * (steps - n));
+                } else if (m.turn != 0.0) {
+                    if (steps == m.curStep + 1) {
                         double nvx = m.stepVx * m.cosTurn - m.stepVy * m.sinTurn;
                         double nvy = m.stepVx * m.sinTurn + m.stepVy * m.cosTurn;
                         m.stepVx = nvx;
                         m.stepVy = nvy;
                         m.curDx += nvx;
                         m.curDy += nvy;
+                        m.curStep = steps;
+                    } else {
+                        m.curDx = 0.0;
+                        m.curDy = 0.0;
+                        m.stepVx = m.vx;
+                        m.stepVy = m.vy;
+                        for (int s = 0; s < steps; ++s) {
+                            double nvx = m.stepVx * m.cosTurn - m.stepVy * m.sinTurn;
+                            double nvy = m.stepVx * m.sinTurn + m.stepVy * m.cosTurn;
+                            m.stepVx = nvx;
+                            m.stepVy = nvy;
+                            m.curDx += nvx;
+                            m.curDy += nvy;
+                        }
+                        m.curStep = steps;
                     }
-                    m.curStep = steps;
+                    x = m.x + m.curDx;
+                    y = m.y + m.curDy;
                 }
-                x = m.x + m.curDx;
-                y = m.y + m.curDy;
+                m.object->m_positionX = x;
+                m.object->m_positionY = y;
             }
 
-            m.object->m_positionX = x;
-            m.object->m_positionY = y;
             m.object->setObjectRectDirty(true);
             m.object->m_isOrientedBoxDirty = true;
             m.dirty = true;
 
-            if (std::abs(x - ghostX) <= 220.0 && std::abs(y - ghostY) <= 220.0) {
-                if (m.vrot != 0.0) {
+            if (std::abs(x - ghostX) <= m.syncRadius && std::abs(y - ghostY) <= m.syncRadius) {
+                if (m.vrot != 0.0 && !m.suppressRot) {
                     double spun = m.vrot * steps;
                     m.object->setRotationX(static_cast<float>(m.rotX + spun));
                     m.object->setRotationY(static_cast<float>(m.rotY + spun));
                 }
-                m.object->setPosition({ static_cast<float>(x), static_cast<float>(y) });
+                if (!m.suppressPos) {
+                    m.object->setPosition({ static_cast<float>(x), static_cast<float>(y) });
+                }
             }
         }
     }
@@ -904,37 +948,49 @@ namespace {
         return typeinfo_cast<GameObject*>(layer->m_parentGroupsDict->objectForKey(group));
     }
 
-    void fillMove(GJBaseGameLayer* layer, EffectGameObject* t, TriggerKind kind, float tickLength, ScriptedMove& m) {
+    GameObject* firstOrParentOfGroup(GJBaseGameLayer* layer, int group) {
+        if (group <= 0) return nullptr;
+        if (auto* p = groupParentOf(layer, group)) return p;
+        auto* arr = layer->getGroup(group);
+        if (arr && arr->count() > 0) {
+            return static_cast<GameObject*>(arr->objectAtIndex(0));
+        }
+        return nullptr;
+    }
+
+    bool fillMove(GJBaseGameLayer* layer, EffectGameObject* t, TriggerKind kind, float tickLength, ScriptedMove& m) {
         m.kind = kind;
+        m.targetGroupID = t->m_targetGroupID;
         m.steps = t->m_duration * 60.0 / tickLength;
         m.easing = static_cast<int>(t->m_easingType);
         m.rate = t->m_easingRate;
         if (kind == TriggerKind::Move) {
-            m.dx = t->m_moveOffset.x;
-            m.dy = t->m_moveOffset.y;
-            m.lockPlayerX = t->m_lockToPlayerX;
+            if (t->m_useMoveTarget) {
+                auto* src = firstOrParentOfGroup(layer, t->m_targetGroupID);
+                auto* dst = firstOrParentOfGroup(layer, t->m_centerGroupID);
+                if (!src || !dst) return false;
+                m.dx = dst->m_positionX - src->m_positionX;
+                m.dy = dst->m_positionY - src->m_positionY;
+            } else {
+                m.dx = t->m_moveOffset.x;
+                m.dy = t->m_moveOffset.y;
+            }
+            m.lockPlayerX = t->m_lockToPlayerX || t->m_lockToCameraX;
             m.lockPlayerY = t->m_lockToPlayerY;
-            return;
+            return true;
         }
         m.angle = t->m_rotationDegrees + 360.0 * t->m_times360;
         m.lockRot = t->m_lockObjectRotation;
-        GameObject* pivot = nullptr;
-        if (t->m_centerGroupID > 0) {
-            pivot = groupParentOf(layer, t->m_centerGroupID);
-            if (!pivot) {
-                auto* center = layer->getGroup(t->m_centerGroupID);
-                if (center && center->count() > 0) {
-                    pivot = static_cast<GameObject*>(center->objectAtIndex(0));
-                }
-            }
-        } else {
-            pivot = groupParentOf(layer, t->m_targetGroupID);
-        }
+        GameObject* pivot = (t->m_centerGroupID > 0)
+            ? firstOrParentOfGroup(layer, t->m_centerGroupID)
+            : groupParentOf(layer, t->m_targetGroupID);
         if (pivot) {
             m.hasCenter = true;
+            m.centerObj = pivot;
             m.cx = pivot->m_positionX;
             m.cy = pivot->m_positionY;
         }
+        return true;
     }
 
     void simToggle(CCArray* group, bool on) {
@@ -957,6 +1013,7 @@ namespace {
     void collectScriptedOnce(GJBaseGameLayer* layer, PlayerObject* refPlayer, int maxTotalTicks) {
         scriptedMoves.clear();
         scriptedObjects.clear();
+        scriptedHasRotate = false;
         if (!Buffer::predictTriggers || !refPlayer || clickMs() > Buffer::budgetMs * 0.25) return;
 
         ensureLevelIndexed(layer);
@@ -969,14 +1026,14 @@ namespace {
 
         double pathMinX = goingLeft ? (px - reach - 60.0) : (px - 60.0);
         double pathMaxX = goingLeft ? (px + 60.0) : (px + reach + 60.0);
-        double pathMinY = py - 260.0, pathMaxY = py + 260.0;
+        double pathMinY = py - 280.0, pathMaxY = py + 280.0;
 
         int totalGroupInspected = 0;
         int totalChainVisited = 0;
 
         auto nearPath = [&](GameObject* object, ScriptedMove const& m) {
             if (m.lockPlayerX || m.lockPlayerY) {
-                return std::abs(object->m_positionX - px) <= 320.0 && std::abs(object->m_positionY - py) <= 260.0;
+                return std::abs(object->m_positionX - px) <= 340.0 && std::abs(object->m_positionY - py) <= 280.0;
             }
             double x = object->m_positionX, y = object->m_positionY;
             double x0 = x, x1 = x, y0 = y, y1 = y;
@@ -984,12 +1041,12 @@ namespace {
                 x0 = std::min(x, x + m.dx); x1 = std::max(x, x + m.dx);
                 y0 = std::min(y, y + m.dy); y1 = std::max(y, y + m.dy);
             } else if (m.hasCenter) {
-                double r = std::hypot(x - m.cx, y - m.cy);
+                double r = std::hypot(x - m.cx, y - m.cy) + 60.0;
                 x0 = m.cx - r; x1 = m.cx + r;
                 y0 = m.cy - r; y1 = m.cy + r;
             }
-            constexpr double SIZE = 55.0;
-            return x1 + SIZE >= pathMinX && x0 - SIZE <= pathMaxX && y1 + SIZE >= pathMinY && y0 - SIZE <= pathMaxY;
+            double halfExt = 55.0 + 0.5 * std::max(std::abs(object->m_width * object->m_scaleX), std::abs(object->m_height * object->m_scaleY));
+            return x1 + halfExt >= pathMinX && x0 - halfExt <= pathMaxX && y1 + halfExt >= pathMinY && y0 - halfExt <= pathMaxY;
         };
 
         auto findOrAddScriptedObj = [&](GameObject* object) -> ScriptedObject* {
@@ -999,31 +1056,39 @@ namespace {
             if (scriptedObjects.size() >= SCRIPTED_OBJECT_LIMIT) return nullptr;
             bool isMover = std::any_of(movers.begin(), movers.end(), [&](Mover const& mv) { return mv.object == object; });
             scriptedObjects.push_back({ object, object->m_positionX, object->m_positionY, object->getPosition(),
-                object->getRotationX(), object->getRotationY(), isMover });
+                object->getRotationX(), object->getRotationY(), objectSyncRadius(object), isMover });
             return &scriptedObjects.back();
         };
 
         auto addMove = [&](EffectGameObject* t, double x, TriggerKind kind, bool armed, int when, bool touch, CCRect const& tr) {
             if (static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT ||
-                totalGroupInspected > 500 || clickMs() > Buffer::budgetMs * 0.22) {
+                totalGroupInspected > 650 || clickMs() > Buffer::budgetMs * 0.24) {
                 return;
             }
             int elapsed = (armed && when < 0) ? -when : -1;
-            auto* group = layer->getGroup(t->m_targetGroupID);
-            if (!group || group->count() == 0) return;
 
             ScriptedMove m;
             m.kind = kind;
+            m.targetGroupID = t->m_targetGroupID;
             m.x = x;
             m.touchTriggered = touch;
             m.touchRect = tr;
             m.initArmed = armed;
             m.armed = armed;
+            m.fromFired = (armed && when < 0);
             m.initFireStep = armed ? when : -1;
             m.fireStep = m.initFireStep;
             m.delay = armed ? 0 : when;
             m.anchorPlayerX = px;
             m.anchorPlayerY = py;
+
+            if (kind == TriggerKind::Stop) {
+                scriptedMoves.push_back(m);
+                return;
+            }
+
+            auto* group = layer->getGroup(t->m_targetGroupID);
+            if (!group || group->count() == 0) return;
 
             if (kind == TriggerKind::Toggle) {
                 m.group = group;
@@ -1031,7 +1096,9 @@ namespace {
                 scriptedMoves.push_back(m);
                 return;
             }
-            fillMove(layer, t, kind, tickLength, m);
+            if (!fillMove(layer, t, kind, tickLength, m)) {
+                return;
+            }
             if (elapsed >= 0) {
                 if (m.steps < 0.5 || elapsed >= m.steps) return;
                 m.from = easeMove(m.easing, m.rate, elapsed / m.steps);
@@ -1040,22 +1107,23 @@ namespace {
             bool any = false;
             int groupSeen = 0;
             for (auto* object : CCArrayExt<GameObject*>(group)) {
-                if (!object || ++groupSeen > 96 || ++totalGroupInspected > 500) break;
+                if (!object || ++groupSeen > 128 || ++totalGroupInspected > 650) break;
                 if (object == t || object->m_isDecoration || object->m_objectType == GameObjectType::Decoration || !nearPath(object, m)) {
                     continue;
                 }
-                bool isMover = std::any_of(movers.begin(), movers.end(), [&](Mover const& mv) { return mv.object == object; });
-                if (armed && when < 0 && isMover && !m.lockPlayerX && !m.lockPlayerY) {
-                    continue;
-                }
                 if (auto* so = findOrAddScriptedObj(object)) {
-                    if (so->moveCount < 8) {
+                    if (so->moveCount < 12) {
                         so->moves[so->moveCount++] = moveIdx;
+                        if (m.fromFired) {
+                            if (kind == TriggerKind::Move) so->activeFiredMove = true;
+                            else if (kind == TriggerKind::Rotate) so->activeFiredRotate = true;
+                        }
                         any = true;
                     }
                 }
             }
             if (any) {
+                if (kind == TriggerKind::Rotate) scriptedHasRotate = true;
                 scriptedMoves.push_back(m);
             }
         };
@@ -1074,19 +1142,19 @@ namespace {
         }
 
         auto spawnChain = [&](auto&& self, int groupID, double x, bool armed, int when, int depth, bool touch, CCRect const& tr) -> void {
-            if (depth > 2 || totalChainVisited > 140 || totalGroupInspected > 500 ||
+            if (depth > 4 || totalChainVisited > 160 || totalGroupInspected > 650 ||
                 static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT ||
-                clickMs() > Buffer::budgetMs * 0.22) {
+                clickMs() > Buffer::budgetMs * 0.24) {
                 return;
             }
             auto* group = layer->getGroup(groupID);
             if (!group) return;
             int seen = 0;
             for (auto* object : CCArrayExt<GameObject*>(group)) {
-                if (!object || ++seen > 64 || ++totalChainVisited > 140) break;
+                if (!object || ++seen > 64 || ++totalChainVisited > 160) break;
                 if (static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT) break;
                 int id = object->m_objectID;
-                if (id != 901 && id != 1346 && id != 1049 && id != 1268) continue;
+                if (id != 901 && id != 1346 && id != 1049 && id != 1268 && id != 1616) continue;
                 auto* c = static_cast<EffectGameObject*>(object);
                 if (!c->m_isSpawnTriggered) continue;
                 if (id == 1268) {
@@ -1095,6 +1163,8 @@ namespace {
                     }
                 } else if (id == 1049) {
                     if (c->m_targetGroupID > 0) addMove(c, x, TriggerKind::Toggle, armed, when, touch, tr);
+                } else if (id == 1616) {
+                    if (c->m_targetGroupID > 0) addMove(c, x, TriggerKind::Stop, armed, when, touch, tr);
                 } else if (plainTrigger(c, id == 1346)) {
                     addMove(c, x, id == 1346 ? TriggerKind::Rotate : TriggerKind::Move, armed, when, touch, tr);
                 }
@@ -1115,7 +1185,7 @@ namespace {
             [](auto const& m, double x) { return m.x < x; });
         for (; it != levelTriggers.end() && it->x <= trigMaxX; ++it) {
             if (static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT ||
-                totalGroupInspected > 500 || clickMs() > Buffer::budgetMs * 0.22) {
+                totalGroupInspected > 650 || clickMs() > Buffer::budgetMs * 0.24) {
                 break;
             }
             if (it->trigger->m_activated) continue;
@@ -1128,6 +1198,20 @@ namespace {
 
         if (scriptedMoves.empty()) {
             scriptedObjects.clear();
+            scriptedHasRotate = false;
+            return;
+        }
+
+        // Suppress blind linear Mover extrapolation on axes already driven by an exact active firedMoves trigger
+        for (auto const& so : scriptedObjects) {
+            if (!so.mover || (!so.activeFiredMove && !so.activeFiredRotate)) continue;
+            for (auto& mv : movers) {
+                if (mv.object == so.object) {
+                    if (so.activeFiredMove) mv.suppressPos = true;
+                    if (so.activeFiredRotate) mv.suppressRot = true;
+                    break;
+                }
+            }
         }
     }
 
@@ -1136,7 +1220,12 @@ namespace {
             m.armed = m.initArmed;
             m.fireStep = m.initFireStep;
             m.toggled = false;
+            m.stopped = false;
             m.stepActive = false;
+            if (m.centerObj) {
+                m.cx = m.centerObj->m_positionX;
+                m.cy = m.centerObj->m_positionY;
+            }
             if (m.armed && (m.lockPlayerX || m.lockPlayerY)) {
                 m.anchorPlayerX = ghostStartX;
                 m.anchorPlayerY = ghostStartY;
@@ -1147,11 +1236,9 @@ namespace {
     inline void restoreScriptedRunPositions() {
         for (auto& o : scriptedObjects) {
             if (o.placed) {
-                if (!o.mover) {
-                    o.object->setPosition(o.node);
-                    o.object->m_positionX = o.x;
-                    o.object->m_positionY = o.y;
-                }
+                o.object->setPosition(o.node);
+                o.object->m_positionX = o.x;
+                o.object->m_positionY = o.y;
                 if (o.rotated) {
                     o.object->setRotationX(o.rotX);
                     o.object->setRotationY(o.rotY);
@@ -1173,7 +1260,8 @@ namespace {
         CCRect r1, r2;
         int nextStep = tick + 1;
 
-        for (auto& m : scriptedMoves) {
+        for (size_t i = 0; i < scriptedMoves.size(); ++i) {
+            auto& m = scriptedMoves[i];
             if (!m.armed) {
                 bool reached = false;
                 if (m.touchTriggered) {
@@ -1193,6 +1281,22 @@ namespace {
                     m.anchorPlayerY = gy;
                 }
             }
+            if (m.kind == TriggerKind::Stop) {
+                if (m.armed && !m.stopped && tick >= m.fireStep) {
+                    m.stopped = true;
+                    for (size_t j = 0; j < scriptedMoves.size(); ++j) {
+                        if (j == i) continue;
+                        auto& other = scriptedMoves[j];
+                        if (other.targetGroupID == m.targetGroupID &&
+                            (other.kind == TriggerKind::Move || other.kind == TriggerKind::Rotate)) {
+                            other.stopped = true;
+                            other.stepActive = false;
+                        }
+                    }
+                }
+                m.stepActive = false;
+                continue;
+            }
             if (m.kind == TriggerKind::Toggle) {
                 if (m.armed && !m.toggled && tick >= m.fireStep && m.group) {
                     m.toggled = true;
@@ -1202,7 +1306,12 @@ namespace {
                 continue;
             }
 
-            if (!m.armed || nextStep <= m.fireStep) {
+            if (m.stopped) {
+                continue;
+            }
+
+            bool instantReady = (m.steps < 0.5 && tick >= m.fireStep);
+            if (!m.armed || (!instantReady && nextStep <= m.fireStep)) {
                 m.stepActive = false;
                 continue;
             }
@@ -1226,23 +1335,79 @@ namespace {
     }
 
     void placeScripted(double ghostX, double ghostY) {
+        if (!scriptedHasRotate) {
+            for (auto& o : scriptedObjects) {
+                double x = (o.mover && !o.activeFiredMove) ? o.object->m_positionX : o.x;
+                double y = (o.mover && !o.activeFiredMove) ? o.object->m_positionY : o.y;
+                bool any = false;
+                for (uint8_t idx = 0; idx < o.moveCount; ++idx) {
+                    auto const& m = scriptedMoves[o.moves[idx]];
+                    if (!m.stepActive) continue;
+                    any = true;
+                    if (m.kind == TriggerKind::Move) {
+                        x += m.dx * m.stepF;
+                        y += m.dy * m.stepF;
+                        if (m.stepActiveLock) {
+                            if (m.lockPlayerX) x += (ghostX - m.anchorPlayerX);
+                            if (m.lockPlayerY) y += (ghostY - m.anchorPlayerY);
+                        }
+                    }
+                }
+                if (!any && !o.placed) continue;
+                if (o.placed && !(o.mover && !o.activeFiredMove) && x == o.lastX && y == o.lastY) continue;
+                o.lastX = x;
+                o.lastY = y;
+                o.object->m_positionX = x;
+                o.object->m_positionY = y;
+                o.object->setObjectRectDirty(true);
+                o.object->m_isOrientedBoxDirty = true;
+                o.placed = true;
+
+                if (std::abs(x - ghostX) <= o.syncRadius && std::abs(y - ghostY) <= o.syncRadius) {
+                    o.object->setPosition({ static_cast<float>(x), static_cast<float>(y) });
+                }
+            }
+            return;
+        }
+
+        // Pass 1: Apply translations & update pivot m_positionX/Y before evaluating rotations
         for (auto& o : scriptedObjects) {
-            double x = o.mover ? o.object->m_positionX : o.x;
-            double y = o.mover ? o.object->m_positionY : o.y;
+            double x = (o.mover && !o.activeFiredMove) ? o.object->m_positionX : o.x;
+            double y = (o.mover && !o.activeFiredMove) ? o.object->m_positionY : o.y;
+            for (uint8_t idx = 0; idx < o.moveCount; ++idx) {
+                auto const& m = scriptedMoves[o.moves[idx]];
+                if (!m.stepActive || m.kind != TriggerKind::Move) continue;
+                x += m.dx * m.stepF;
+                y += m.dy * m.stepF;
+                if (m.stepActiveLock) {
+                    if (m.lockPlayerX) x += (ghostX - m.anchorPlayerX);
+                    if (m.lockPlayerY) y += (ghostY - m.anchorPlayerY);
+                }
+            }
+            o.tempX = x;
+            o.tempY = y;
+            o.object->m_positionX = x;
+            o.object->m_positionY = y;
+        }
+
+        for (auto& m : scriptedMoves) {
+            if (m.stepActive && m.kind == TriggerKind::Rotate && m.hasCenter && m.centerObj) {
+                m.cx = m.centerObj->m_positionX;
+                m.cy = m.centerObj->m_positionY;
+            }
+        }
+
+        // Pass 2: Apply rotations around live pivots & sync transforms
+        for (auto& o : scriptedObjects) {
+            double x = o.tempX;
+            double y = o.tempY;
             double spin = 0.0;
             bool any = false;
             for (uint8_t idx = 0; idx < o.moveCount; ++idx) {
                 auto const& m = scriptedMoves[o.moves[idx]];
                 if (!m.stepActive) continue;
                 any = true;
-                if (m.kind == TriggerKind::Move) {
-                    x += m.dx * m.stepF;
-                    y += m.dy * m.stepF;
-                    if (m.stepActiveLock) {
-                        if (m.lockPlayerX) x += (ghostX - m.anchorPlayerX);
-                        if (m.lockPlayerY) y += (ghostY - m.anchorPlayerY);
-                    }
-                } else if (m.kind == TriggerKind::Rotate) {
+                if (m.kind == TriggerKind::Rotate) {
                     if (m.hasCenter) {
                         double rx = x - m.cx, ry = y - m.cy;
                         x = m.cx + rx * m.stepCos - ry * m.stepSin;
@@ -1254,7 +1419,7 @@ namespace {
                 }
             }
             if (!any && !o.placed) continue;
-            if (o.placed && !o.mover && x == o.lastX && y == o.lastY && spin == o.lastSpin) continue;
+            if (o.placed && !(o.mover && !o.activeFiredMove) && x == o.lastX && y == o.lastY && spin == o.lastSpin) continue;
             o.lastX = x;
             o.lastY = y;
             o.lastSpin = spin;
@@ -1264,7 +1429,7 @@ namespace {
             o.object->m_isOrientedBoxDirty = true;
             o.placed = true;
 
-            if (std::abs(x - ghostX) <= 220.0 && std::abs(y - ghostY) <= 220.0) {
+            if (std::abs(x - ghostX) <= o.syncRadius && std::abs(y - ghostY) <= o.syncRadius) {
                 o.object->setPosition({ static_cast<float>(x), static_cast<float>(y) });
                 if (spin != 0.0 || o.rotated) {
                     o.object->setRotationX(static_cast<float>(o.rotX + spin));
@@ -1303,7 +1468,6 @@ namespace {
     struct ScopedClickWorld {
         ScopedClickWorld(PlayLayer* layer, PlayerObject* p1, int maxTicks) {
             if (++clickWorldDepth == 1) {
-                buf.ghostUsedParticles = false;
                 markTopLevelNodes(layer);
                 collectMoversOnce();
                 collectScriptedOnce(layer, p1, maxTicks);
@@ -1318,6 +1482,7 @@ namespace {
                 }
                 scriptedObjects.clear();
                 scriptedMoves.clear();
+                scriptedHasRotate = false;
                 if (buf.ghost1) {
                     buf.ghost1->stopAllActions();
                     buf.ghost1->stopParticles();
@@ -3024,11 +3189,16 @@ class $modify(BufEffectGameObject, EffectGameObject) {
 
     void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
         if (buf.simulating) return;
-        if ((m_objectID == 901 || m_objectID == 1346) && Buffer::predictTriggers && m_duration > 0.f) {
+        if (m_objectID == 1616 && Buffer::predictTriggers && m_targetGroupID > 0) {
+            int gid = m_targetGroupID;
+            std::erase_if(firedMoves, [gid](FiredMove const& fm) { return fm.targetGroupID == gid; });
+            std::erase_if(pendingSpawns, [gid](PendingSpawn const& p) { return p.group == gid; });
+        } else if ((m_objectID == 901 || m_objectID == 1346) && Buffer::predictTriggers && m_duration > 0.f) {
             bool updated = false;
             for (auto& fm : firedMoves) {
                 if (fm.trigger == this) {
                     fm.tick = tickCount;
+                    fm.targetGroupID = m_targetGroupID;
                     updated = true;
                     break;
                 }
@@ -3039,7 +3209,7 @@ class $modify(BufEffectGameObject, EffectGameObject) {
                     pruneExpiredTriggers();
                 }
                 if (firedMoves.size() < 48) {
-                    firedMoves.push_back({ this, tickCount });
+                    firedMoves.push_back({ this, tickCount, m_targetGroupID });
                 }
             }
         }
@@ -3356,7 +3526,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                     handleSimPortal(player, object, bit, ghostRect, haveRect);
                     return;
                 }
-                double reach = 130.0 + std::max(object->m_width, object->m_height);
+                double reach = 130.0 + std::max(std::abs(object->m_width * object->m_scaleX), std::abs(object->m_height * object->m_scaleY));
                 if (!isSideways && std::abs(object->m_positionX - gx) > reach) return;
                 if (!isSpider && !isSideways && std::abs(object->m_positionY - gy) > reach) return;
                 if (!buf.simDisabled.empty() && vecContains(buf.simDisabled, object)) return;
@@ -3385,7 +3555,8 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         if (!buf.simEnabled.empty() && player) {
             for (auto* object : buf.simEnabled) {
                 if (!object || vecContains(buf.simDisabled, object)) continue;
-                if (std::abs(object->m_positionX - gx) > 160.0 || std::abs(object->m_positionY - gy) > 160.0) {
+                double reach = 160.0 + 0.5 * std::max(std::abs(object->m_width * object->m_scaleX), std::abs(object->m_height * object->m_scaleY));
+                if (std::abs(object->m_positionX - gx) > reach || std::abs(object->m_positionY - gy) > reach) {
                     continue;
                 }
                 auto type = static_cast<unsigned>(object->m_objectType);
